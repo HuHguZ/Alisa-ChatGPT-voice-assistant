@@ -14,8 +14,9 @@ import time
 
 from bridge import ROOT, STATE_DIR, REMOTE, MIC_SOURCE, alive, read_state, dedicated_browser_uses_microphone, ssh, ssh_args, rms
 from browser_control import Browser
-from native_control import cancel_alice, cancel_frame, recognition_event
+from native_control import cancel_frame, pause_frame, recognition_event, send_frame
 from mode_cue import play_closed
+from playback_guard import PlaybackGuard
 
 SOCKET = STATE_DIR / 'voice.sock'
 STATE = STATE_DIR / 'voice.json'
@@ -147,6 +148,7 @@ async def run():
               'successful_actions': 0, 'voice_commands': 0}
     quiet_until = 0.0
     native_proc = None
+    opening_chat = False
 
     def save():
         temp = STATE.with_suffix('.new')
@@ -154,22 +156,32 @@ async def run():
         temp.chmod(0o600)
         temp.replace(STATE)
 
-    async def cancel_native():
+    async def send_native(frame):
         # Reuse the already connected local event stream: no SSH handshake is
         # needed at the moment Alice is about to answer the switching command.
         if native_proc and native_proc.returncode is None:
             try:
-                native_proc.stdin.write(cancel_frame())
+                native_proc.stdin.write(frame)
                 await asyncio.wait_for(native_proc.stdin.drain(), .5)
                 return
             except (OSError, TimeoutError):
                 pass
-        await asyncio.to_thread(cancel_alice, read_state()['host'])
+        await asyncio.to_thread(send_frame, read_state()['host'], frame)
+
+    async def cancel_native():
+        await send_native(cancel_frame())
+
+    async def pause_native():
+        await send_native(pause_frame())
+        status['native_music_pauses'] = status.get('native_music_pauses', 0) + 1
 
     async def start_voice(action):
+        nonlocal opening_chat
         host = read_state()['host']
         await cancel_native()
+        await pause_native()
         await asyncio.to_thread(ssh, host, f'touch {REMOTE}/native-muted')
+        opening_chat = True
         try:
             if action == 'new':
                 await browser.close()
@@ -188,8 +200,12 @@ async def run():
             raise RuntimeError('Voice mode did not start; inspect the controller status')
         except BaseException:
             with contextlib.suppress(Exception):
+                await browser.close()
+            with contextlib.suppress(Exception):
                 await asyncio.to_thread(ssh, host, f'rm -f {REMOTE}/native-muted')
             raise
+        finally:
+            opening_chat = False
 
     async def execute(action, spoken=False):
         nonlocal quiet_until
@@ -391,6 +407,10 @@ async def run():
 
     listener = asyncio.create_task(listen())
     native_watcher = asyncio.create_task(watch_native())
+    music_guard = PlaybackGuard(
+        lambda: opening_chat or bool(browser.proc and browser.proc.poll() is None and
+                                    read_state().get('native_alice_paused')), pause_native)
+    music_watcher = asyncio.create_task(music_guard.run())
     save()
     try:
         while not stop.is_set():
@@ -401,6 +421,12 @@ async def run():
                 listener.result()
             if native_watcher.done():
                 native_watcher.result()
+            if music_watcher.done():
+                music_watcher.result()
+            if music_guard.error:
+                status['native_music_pause_error'] = music_guard.error
+            else:
+                status.pop('native_music_pause_error', None)
             if not serial.locked():
                 async with serial:
                     with contextlib.suppress(Exception):
@@ -410,6 +436,7 @@ async def run():
     finally:
         listener.cancel()
         native_watcher.cancel()
+        music_watcher.cancel()
         if early_cancel_task:
             early_cancel_task.cancel()
             await asyncio.gather(early_cancel_task, return_exceptions=True)
@@ -423,7 +450,7 @@ async def run():
         if capture.returncode is None:
             capture.terminate()
         await capture.wait()
-        await asyncio.gather(listener, native_watcher, return_exceptions=True)
+        await asyncio.gather(listener, native_watcher, music_watcher, return_exceptions=True)
         status['phase'] = 'stopped'
         save()
 

@@ -1,9 +1,10 @@
-"""Cancel just the current Alice dialogue using the station's local IPC.
+"""Cancel Alice's dialogue or pause its player using the station's local IPC.
 
 Wire mapping is the stock CLI cancel action, also documented by spotiya:
 https://github.com/klockky/spotiya/blob/main/src/voice.rs
 """
 import base64
+from uuid import uuid4
 from bridge import ssh
 
 
@@ -80,15 +81,32 @@ def recognition_event(data):
         return None
 
 
-def cancel_frame():
-    # QuasarMessage(type=210) -> CapabilityRemoting(AliceCapability,
-    # method.kind=3): cancel the current conversation, not microphone hardware.
-    method = byte_field(7, b'AliceCapability') + byte_field(8, b'\x08\x03')
+def rpc_frame(capability, field, payload):
+    method = byte_field(7, capability) + byte_field(field, payload)
     message = byte_field(252, method) + varint(253 * 8) + varint(210)
     return len(message).to_bytes(4, 'little') + message
 
 
-def cancel_alice(host):
-    encoded = base64.b64encode(cancel_frame()).decode()
+def cancel_frame():
+    # Stock CLI 'c': cancel the dialogue, not its separate music player.
+    return rpc_frame(b'AliceCapability', 8, b'\x08\x03')
+
+
+def pause_frame():
+    # Stock CLI 'o': PlaybackControlCapabilityMethod kind 1 (pause).
+    # The source describes the external audio owner, as in spotiya.
+    source = (varint(1 * 8) + varint(14) + varint(2 * 8) + varint(3) +
+              varint(3 * 8) + varint(1) + byte_field(4, str(uuid4()).encode()) +
+              byte_field(6, b'ChatGPTVoice'))
+    method = b'\x08\x01' + byte_field(5, source) + varint(7 * 8) + varint(0)
+    return rpc_frame(b'PlaybackControlCapability', 13, method)
+
+
+def send_frame(host, frame):
+    encoded = base64.b64encode(frame).decode()
     ssh(host, f"printf '%s' '{encoded}' | base64 -d | "
         'socat -u STDIN TCP:127.0.0.1:9875,connect-timeout=2', timeout=6)
+
+
+def cancel_alice(host):
+    send_frame(host, cancel_frame())

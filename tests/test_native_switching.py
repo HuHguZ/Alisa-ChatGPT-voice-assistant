@@ -5,7 +5,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from native_control import byte_field, varint, recognition_event
+from native_control import byte_field, varint, recognition_event, fields, cancel_frame, pause_frame
 from voice import EarlyCancel
 
 
@@ -24,6 +24,30 @@ def event(final=True, busy=True, matching_text=True):
 
 
 class NativeEvents(unittest.TestCase):
+    def test_cancel_keeps_dialogue_action_separate_from_music(self):
+        frame = cancel_frame()
+        self.assertEqual(int.from_bytes(frame[:4], 'little'), len(frame) - 4)
+        envelope = fields(frame[4:])
+        self.assertEqual(envelope[253], 210)
+        method = fields(envelope[252])
+        self.assertEqual(method[7], b'AliceCapability')
+        self.assertEqual(fields(method[8])[1], 3)
+
+    def test_music_command_is_pause_and_not_toggle_or_resume(self):
+        frame = pause_frame()
+        self.assertEqual(int.from_bytes(frame[:4], 'little'), len(frame) - 4)
+        envelope = fields(frame[4:])
+        self.assertEqual(envelope[253], 210)
+        remoting = fields(envelope[252])
+        self.assertEqual(remoting[7], b'PlaybackControlCapability')
+        method = fields(remoting[13])
+        self.assertEqual(method[1], 1)
+        self.assertEqual(method[7], 0)
+        source = fields(method[5])
+        self.assertEqual([source[1], source[2], source[3]], [14, 3, 1])
+        self.assertEqual(source[6], b'ChatGPTVoice')
+        self.assertEqual(len(source[4]), 36)
+
     def test_only_final_matching_native_query_is_accepted(self):
         self.assertEqual(recognition_event(event()),
                          ('01234567-1234-5678-9abc-0123456789ab', 'открой чат'))

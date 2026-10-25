@@ -1,0 +1,2 @@
+# Optional generated-speech smoke test only; not needed by the running bridge.
+piper-tts==1.8.0

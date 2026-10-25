@@ -1,0 +1,32 @@
+# Dependencies, compiled helpers and downloaded models
+.venv/
+__pycache__/
+*.py[cod]
+/build/
+/models/
+/display-tools/
+
+# Device backups, local measurements, authentication and recordings
+/backups/
+/*-test*.json
+/verified-configuration.json
+/autostart-verification.json
+/browser-profile/
+/state/
+.env
+.env.*
+*.pem
+*.key
+id_ed25519*
+*.wav
+*.raw
+*.pcm
+*.log
+*.zip
+*.tar.*
+
+# Keep only the source of optional smoke tests
+/test-tools/*
+!/test-tools/requirements.txt
+!/test-tools/verify_marker_resume.py
+!/test-tools/verify_mode_cue.py

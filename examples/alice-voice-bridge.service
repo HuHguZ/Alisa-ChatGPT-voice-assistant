@@ -1,0 +1,21 @@
+[Unit]
+Description=Yandex Station audio bridge and ChatGPT voice controls
+Wants=pipewire-pulse.service
+After=pipewire-pulse.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# This example assumes the repository is cloned directly into your home.
+# Adjust all three paths if you choose another directory.
+WorkingDirectory=%h/Alisa-ChatGPT-voice-assistant
+ExecStart=/usr/bin/python3 %h/Alisa-ChatGPT-voice-assistant/bridge.py start
+ExecStop=/usr/bin/python3 %h/Alisa-ChatGPT-voice-assistant/bridge.py stop
+Environment=PYTHONUNBUFFERED=1
+TimeoutStopSec=45
+KillMode=mixed
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=default.target

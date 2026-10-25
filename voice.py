@@ -12,7 +12,7 @@ import re
 import signal
 import time
 
-from bridge import ROOT, STATE_DIR, REMOTE, MIC_SOURCE, alive, read_state, dedicated_browser_uses_microphone, ssh, ssh_args, rms
+from bridge import ROOT, STATE_DIR, REMOTE, MIC_SOURCE, alive, read_state, dedicated_browser_uses_microphone, prepare_browser_audio, ssh, ssh_args, rms
 from browser_control import Browser
 from native_control import cancel_frame, pause_frame, recognition_event, send_frame
 from mode_cue import play_closed
@@ -191,7 +191,7 @@ async def run():
                 await browser.launch()
                 await browser.resume_previous()
             for _ in range(30):
-                if await asyncio.to_thread(dedicated_browser_uses_microphone):
+                if await asyncio.to_thread(prepare_browser_audio):
                     return {'ok': True, 'action': action, 'voice_active': True}
                 if await browser.click_voice():
                     await asyncio.sleep(1.5)

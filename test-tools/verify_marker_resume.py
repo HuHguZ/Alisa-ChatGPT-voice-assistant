@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from piper import PiperVoice
-from bridge import STATE_DIR, read_state
+from bridge import MIC_SOURCE, SPEAKER, STATE_DIR, dedicated_browser_streams, read_state
 
 CONVERSATION = STATE_DIR / 'conversation.json'
 VOICE = STATE_DIR / 'voice.json'
@@ -59,6 +59,23 @@ def main():
               'test_input': 'Piper-generated speech into shared microphone source',
               'checks': []}
     voice = PiperVoice.load(str(ROOT / 'test-tools/piper/ru_RU-irina-medium.onnx'))
+
+    def check_audio(stage):
+        captures = dedicated_browser_streams('source-outputs')
+        outputs = dedicated_browser_streams('sink-inputs')
+        sources = json.loads(subprocess.check_output(['pactl', '-f', 'json', 'list', 'sources']))
+        sinks = json.loads(subprocess.check_output(['pactl', '-f', 'json', 'list', 'sinks']))
+        source = next(s for s in sources if s.get('name') == MIC_SOURCE)
+        sink = next(s for s in sinks if s.get('name') == SPEAKER)
+        check = {'stage': stage,
+                 'capture_unmuted': bool(captures) and all(not e.get('mute') for e in captures),
+                 'capture_routed_to_station': bool(captures) and all(
+                     e.get('source') == source['index'] for e in captures),
+                 'playback_unmuted': all(not e.get('mute') for e in outputs),
+                 'playback_routed_to_station': all(e.get('sink') == sink['index'] for e in outputs)}
+        report.setdefault('audio_checks', []).append(check)
+        if not all(value for key, value in check.items() if key != 'stage'):
+            raise RuntimeError('Dedicated browser audio is muted or routed incorrectly')
 
     def speak(text):
         chunks = list(voice.synthesize(text))
@@ -107,6 +124,7 @@ def main():
         # All generated speech belongs to a separate disposable conversation.
         control('new')
         time.sleep(3)
+        check_audio('new_chat')
         if not speak('Сколько будет два плюс два? Ответь кратко.'):
             wait(lambda: read(INDICATOR).get('speaking'), 40)
         report['reply_detected'] = True
@@ -121,6 +139,7 @@ def main():
         report['resumed_saved_conversation'] = health['conversation_matches_saved']
         if not report['resumed_saved_conversation']:
             raise RuntimeError('Previous conversation was not resumed')
+        check_audio('reopened_chat')
         command('Алиса, закрой чат.', 'close')
         report['native_events_connected'] = read(VOICE).get('native_events_connected', False)
         report['passed'] = all(c['passed'] for c in report['checks'])

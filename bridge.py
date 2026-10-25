@@ -206,21 +206,60 @@ def open_browser() -> None:
     print(result.decode(), end='')
 
 
-def dedicated_browser_uses_microphone() -> bool:
-    """Inspect audio routing metadata; never inspect website/session storage."""
+def dedicated_browser_streams(kind: str) -> list[dict]:
+    """Inspect only streams owned by the dedicated browser profile."""
     profile = str(STATE_DIR / 'browser-profile').encode()
-    entries = json.loads(command('pactl', '-f', 'json', 'list', 'source-outputs'))
+    entries = json.loads(command('pactl', '-f', 'json', 'list', kind))
+    owned = []
     for entry in entries:
         props = entry.get('properties', {})
-        if entry.get('corked') or 'chrom' not in props.get('application.name', '').lower():
+        if 'chrom' not in props.get('application.name', '').lower():
             continue
         try:
             pid = int(props['application.process.id'])
             if profile in Path(f'/proc/{pid}/cmdline').read_bytes():
-                return True
+                owned.append(entry)
         except (KeyError, ValueError, OSError):
             continue
-    return False
+    return owned
+
+
+def dedicated_browser_uses_microphone() -> bool:
+    return any(not entry.get('corked')
+               for entry in dedicated_browser_streams('source-outputs'))
+
+
+def prepare_browser_audio() -> bool:
+    """Restore dedicated stream routing and mute on an explicit chat opening.
+
+    PulseAudio can remember a previous recording stream's mute across browser
+    restarts. An open capture stream alone does not mean its samples are heard.
+    Global microphone mute and other browser profiles are never changed.
+    """
+    capture = dedicated_browser_streams('source-outputs')
+    if not capture:
+        return False
+    sources = json.loads(command('pactl', '-f', 'json', 'list', 'sources'))
+    sinks = json.loads(command('pactl', '-f', 'json', 'list', 'sinks'))
+    source = next((s for s in sources if s.get('name') == MIC_SOURCE), None)
+    sink = next((s for s in sinks if s.get('name') == SPEAKER), None)
+    if not source or not sink:
+        raise RuntimeError('Station audio devices are unavailable')
+    if source.get('mute'):
+        raise RuntimeError('Station virtual microphone is muted')
+    for entry in capture:
+        index = str(entry['index'])
+        if entry.get('source') != source['index']:
+            command('pactl', 'move-source-output', index, MIC_SOURCE)
+        if entry.get('mute'):
+            command('pactl', 'set-source-output-mute', index, '0')
+    for entry in dedicated_browser_streams('sink-inputs'):
+        index = str(entry['index'])
+        if entry.get('sink') != sink['index']:
+            command('pactl', 'move-sink-input', index, SPEAKER)
+        if entry.get('mute'):
+            command('pactl', 'set-sink-input-mute', index, '0')
+    return any(not entry.get('corked') for entry in capture)
 
 
 async def run_bridge(host: str) -> None:

@@ -21,7 +21,7 @@ from playback_guard import PlaybackGuard
 SOCKET = STATE_DIR / 'voice.sock'
 STATE = STATE_DIR / 'voice.json'
 PHRASES = {
-    'открой чат': 'open', 'запусти чат': 'open', 'включи чат': 'open',
+    'открой чат': 'open',
     'создай чат': 'new', 'создай новый чат': 'new',
     'закрой чат': 'close', 'выйди из чата': 'close', 'закончи разговор': 'close',
 }

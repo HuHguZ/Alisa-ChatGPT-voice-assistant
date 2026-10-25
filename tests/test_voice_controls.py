@@ -23,7 +23,8 @@ class Commands(unittest.TestCase):
                        'открой чат', 'закрой чат', 'выйди из чата',
                        'скажи алиса открой чат', 'Алиса, не закрывай чат',
                        'Алиса, включи музыку', 'Алиса, продолжи музыку',
-                       'Алиса, поставь песню']:
+                       'Алиса, поставь песню', 'Алиса, включи чат',
+                       'Алиса, запусти чат']:
             self.assertIsNone(intent(phrase))
 
     def test_marker_confidence_is_required_and_uncertain_close_can_be_accepted(self):

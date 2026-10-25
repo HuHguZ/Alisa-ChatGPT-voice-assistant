@@ -36,7 +36,8 @@ def main():
     baseline = snapshot()
     voice = PiperVoice.load(str(ROOT / 'test-tools/piper/ru_RU-irina-medium.onnx'))
     phrases = ['Алиса, включи музыку.', 'Алиса, продолжи музыку.',
-               'Алиса, поставь песню.', 'Алиса, какая погода?']
+               'Алиса, поставь песню.', 'Алиса, какая погода?',
+               'Алиса, включи чат.', 'Алиса, запусти чат.']
     for phrase in phrases[:1] if args.first_only else phrases:
         chunks = list(voice.synthesize(phrase))
         pcm = subprocess.run([

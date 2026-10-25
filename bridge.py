@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from audio_gain import SpeechGain
+from microphone_transport import MicrophoneTransport, limit_input_pipe
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / '.local/state/alice-voice-bridge'
@@ -303,6 +304,8 @@ async def run_bridge(host: str) -> None:
                                  '--latency-msec=20', '--process-time-msec=10',
                                  '--client-name=AliceVoiceBridge',
                                  '--stream-name=StationMicrophone')
+        state['microphone_pipe_bytes'] = limit_input_pipe(mic_player.stdin)
+        microphone = MicrophoneTransport(state, rms)
         speaker_monitor = await spawn('pacat', '--record', '--raw', '--format=s16le',
                                       '--rate=48000', '--channels=2',
                                       f'--device={SPEAKER}.monitor', '--latency-msec=20',
@@ -316,7 +319,10 @@ async def run_bridge(host: str) -> None:
         if await asyncio.wait_for(speaker.stdout.readexactly(6), 10) != b'READY\n':
             raise RuntimeError('Station playback worker did not initialize')
         playback_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
-        playback_slots = asyncio.Semaphore(2)
+        # Four blocks keep the existing 80 ms ALSA buffer supplied when the
+        # Wi-Fi round trip occasionally exceeds the old two-block window.
+        playback_slots = asyncio.Semaphore(4)
+        state['playback_window_ms'] = 80
         pending_playback = deque()
         state['playback_dropped_bytes'] = 0
         state['playback_queue_ms'] = 0
@@ -365,15 +371,6 @@ async def run_bridge(host: str) -> None:
                 state['playback_queue_ms'] = playback_queue.qsize() * 20
                 playback_slots.release()
 
-        async def pump(source, dest, key: str, chunk: int) -> None:
-            while data := await source.stdout.read(chunk):
-                dest.stdin.write(data)
-                await dest.stdin.drain()
-                state[key] += len(data)
-                if key == 'capture_bytes':
-                    state['microphone_rms'] = round(rms(data), 6)
-            raise RuntimeError(f'{key} stream ended')
-
         async def errors(proc, name: str) -> None:
             while line := await proc.stderr.readline():
                 message = line.decode(errors='replace').strip()
@@ -399,7 +396,8 @@ async def run_bridge(host: str) -> None:
                     print('Stock Alice recognition:', 'paused' if paused else 'resumed', flush=True)
                 await asyncio.sleep(0.5)
 
-        streams = [asyncio.create_task(pump(capture, mic_player, 'capture_bytes', 960)),
+        streams = [asyncio.create_task(microphone.read(capture.stdout)),
+                   asyncio.create_task(microphone.write(mic_player.stdin)),
                    asyncio.create_task(read_playback()),
                    asyncio.create_task(write_playback()),
                    asyncio.create_task(acknowledge_playback()),

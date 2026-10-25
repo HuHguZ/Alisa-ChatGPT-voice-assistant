@@ -1,4 +1,4 @@
-"""Native final-event validation and early cancellation without recording audio."""
+"""Native final-event validation without recording audio."""
 from pathlib import Path
 import sys
 import unittest
@@ -6,7 +6,6 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from native_control import byte_field, varint, recognition_event, fields, cancel_frame, pause_frame
-from voice import EarlyCancel
 
 
 def integer(field, value):
@@ -60,30 +59,6 @@ class NativeEvents(unittest.TestCase):
             self.assertIsNone(recognition_event(valid[:count]))
         for malformed in [b'', b'\x00', b'\xff' * 20, b'\x0a\xff\xff\xff\x7f']:
             self.assertIsNone(recognition_event(malformed))
-
-
-class EarlyCancellation(unittest.TestCase):
-    def test_wake_word_and_ordinary_alice_queries_remain_untouched(self):
-        early = EarlyCancel()
-        for text in ['алиса', 'открой чат', 'алиса какая погода', 'алиса открой',
-                     'алиса не открывай чат']:
-            self.assertFalse(early.consume(text, now=1))
-            self.assertFalse(early.consume(text, now=2))
-
-    def test_only_stable_complete_opening_can_cancel_once_per_utterance(self):
-        early = EarlyCancel()
-        self.assertFalse(early.consume('алиса открой чат', now=1))
-        self.assertFalse(early.consume('алиса открой чат', now=1.1))
-        self.assertFalse(early.consume('алиса открой чат погоды', now=1.2))
-        self.assertFalse(early.consume('алиса открой чат', now=2))
-        self.assertTrue(early.consume('алиса открой чат', now=2.3))
-        self.assertFalse(early.consume('алиса открой чат', now=3))
-        early.reset()
-        self.assertFalse(early.consume('алиса создай новый чат', now=4))
-        self.assertTrue(early.consume('алиса создай новый чат', now=4.3))
-        early.reset()
-        self.assertFalse(early.consume('алиса закрой чат', now=5))
-        self.assertFalse(early.consume('алиса закрой чат', now=6))
 
 
 if __name__ == '__main__':

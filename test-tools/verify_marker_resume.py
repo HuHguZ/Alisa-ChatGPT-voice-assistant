@@ -101,6 +101,7 @@ def main():
     def command(text, expected):
         time.sleep(2.5)
         previous = read(VOICE).get('voice_commands', 0)
+        previous_cancels = read(VOICE).get('native_dialogue_cancels', 0)
         speak(text)
         value = wait(lambda: (s if s.get('voice_commands', 0) > previous else None)
                      if (s := read(VOICE)) else None, 40)
@@ -112,8 +113,8 @@ def main():
             check['cue_error'] = value.get('cue_error')
             check['passed'] = check['passed'] and check['close_cues'] > 0 and not check['cue_error']
         if expected == 'open':
-            check['early_cancels'] = value.get('early_cancels', 0)
-            check['passed'] = check['passed'] and check['early_cancels'] > 0
+            check['native_dialogue_cancels'] = value.get('native_dialogue_cancels', 0)
+            check['passed'] = check['passed'] and check['native_dialogue_cancels'] > previous_cancels
         report['checks'].append(check)
         print(json.dumps(check, ensure_ascii=False), flush=True)
         if not check['passed']:

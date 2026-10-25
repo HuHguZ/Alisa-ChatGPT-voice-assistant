@@ -78,29 +78,6 @@ class MarkedCommands:
         return action
 
 
-class EarlyCancel:
-    """Cancel native speech for a stable, complete opening command only.
-
-    This does not start ChatGPT: final recognition still validates the command.
-    In particular, hearing just 'Alice' must leave normal Alice queries alone.
-    """
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.candidate, self.since, self.fired = None, 0, False
-
-    def consume(self, partial, now=None):
-        now = time.monotonic() if now is None else now
-        candidate = partial if intent(partial) in ['open', 'new'] else None
-        if candidate != self.candidate:
-            self.candidate, self.since = candidate, now
-        if candidate and not self.fired and now - self.since >= .2:
-            self.fired = True
-            return True
-        return False
-
-
 async def client(action):
     for attempt in range(60):
         try:
@@ -170,6 +147,7 @@ async def run():
 
     async def cancel_native():
         await send_native(cancel_frame())
+        status['native_dialogue_cancels'] = status.get('native_dialogue_cancels', 0) + 1
 
     async def pause_native():
         await send_native(pause_frame())
@@ -267,7 +245,6 @@ async def run():
         f'--device={MIC_SOURCE}', '--latency-msec=80', '--client-name=AliceVoiceCommands',
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     spoken_action = None
-    early_cancel_task = None
     last_command_at = 0.0
 
     def schedule(action, source):
@@ -331,19 +308,7 @@ async def run():
             await asyncio.sleep(2)
 
     async def listen():
-        nonlocal early_cancel_task
         was_reply = False
-        early = EarlyCancel()
-
-        async def preempt_native():
-            try:
-                await cancel_native()
-                status['early_cancels'] = status.get('early_cancels', 0) + 1
-                save()
-            except Exception:
-                # Final recognition and the regular cancellation remain the
-                # fallback if this speculative early cancellation fails.
-                pass
 
         def receive_result(result, alternative=None):
             action = commands.consume(result)
@@ -389,21 +354,19 @@ async def run():
                 status['decoder_gate'] = 'reply' if own_reply else 'transition'
                 recognizer.Reset()
                 close_recognizer.Reset()
-                early.reset()
                 continue
             status['decoder_gate'] = 'listening'
             primary_final = recognizer.AcceptWaveform(block)
             closing_final = close_recognizer.AcceptWaveform(block)
-            if (not primary_final and not read_state().get('native_alice_paused') and
-                    early.consume(json.loads(recognizer.PartialResult()).get('partial', ''))):
-                early_cancel_task = asyncio.create_task(preempt_native())
+            # A constrained partial can turn "включи музыку" into "включи чат"
+            # until the utterance ends. Never cancel Alice on a partial. Exact
+            # native final events still provide the fast switching path.
             if primary_final or closing_final:
                 primary = recognizer.Result() if primary_final else recognizer.FinalResult()
                 closing = close_recognizer.Result() if closing_final else close_recognizer.FinalResult()
                 receive_result(json.loads(primary), json.loads(closing))
                 recognizer.Reset()
                 close_recognizer.Reset()
-                early.reset()
 
     listener = asyncio.create_task(listen())
     native_watcher = asyncio.create_task(watch_native())
@@ -437,9 +400,6 @@ async def run():
         listener.cancel()
         native_watcher.cancel()
         music_watcher.cancel()
-        if early_cancel_task:
-            early_cancel_task.cancel()
-            await asyncio.gather(early_cancel_task, return_exceptions=True)
         if spoken_action:
             spoken_action.cancel()
             await asyncio.gather(spoken_action, return_exceptions=True)

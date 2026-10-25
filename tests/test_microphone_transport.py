@@ -12,6 +12,19 @@ from microphone_transport import BLOCK_BYTES, MicrophoneTransport, limit_input_p
 
 
 class Microphone(unittest.IsolatedAsyncioTestCase):
+    async def test_vqe_rate_keeps_the_same_time_budget_with_smaller_blocks(self):
+        state = {'capture_bytes': 0}
+        stream = MicrophoneTransport(state, lambda _: 0, sample_rate=16000)
+        self.assertEqual(stream.block_bytes, 320)
+        source = asyncio.StreamReader()
+        source.feed_data(bytes(320 * 20))
+        source.feed_eof()
+        with self.assertRaises(asyncio.IncompleteReadError):
+            await stream.read(source)
+        self.assertEqual(state['capture_bytes'], 6400)
+        self.assertEqual(state['microphone_queue_ms'], 60)
+        self.assertEqual(state['microphone_dropped_bytes'], 320 * 14)
+
     async def test_burst_keeps_only_the_fresh_tail_and_counts_drops(self):
         state = {'capture_bytes': 0}
         stream = MicrophoneTransport(state, lambda _: 0)

@@ -28,6 +28,12 @@ REMOTE = '/data/opt/alice-voice'
 MIC_BACKEND = 'alice_station_capture'
 MIC_SOURCE = 'alice_station_mic'
 SPEAKER = 'alice_station_speaker'
+MICROPHONE_MODE = os.environ.get('ALICE_MICROPHONE_SOURCE', 'raw')
+if MICROPHONE_MODE not in ('raw', 'vqe'):
+    raise ValueError('ALICE_MICROPHONE_SOURCE must be raw or vqe')
+MICROPHONE_RATE = 16000 if MICROPHONE_MODE == 'vqe' else 48000
+# Undocumented float32/channel enum ABI: refuse an unverified library build.
+VQE_LIBRARY_SHA256 = 'fa7ad1544fe9ddfccedcf15acc031768345b0b8c7333bc1c0b47bc476dd4152f'
 
 
 def command(*args: str, timeout: float = 15, data: bytes | None = None) -> bytes:
@@ -75,6 +81,10 @@ def save_state(state: dict) -> None:
 
 def stage_station(host: str) -> None:
     """Add a nonblocking capture tap to a separate, temporary launcher profile."""
+    if MICROPHONE_MODE == 'vqe':
+        digest = ssh(host, 'sha256sum /system/vendor/quasar/libs/libyandex_evil.so').decode().split()[0]
+        if digest != VQE_LIBRARY_SHA256:
+            raise RuntimeError('Unverified VQE library ABI; select ALICE_MICROPHONE_SOURCE=raw')
     stock = ssh(host, 'cat /etc/asound.conf').decode()
     launch = json.loads(ssh(host, 'cat /system/vendor/quasar/launch.json'))
     if stock.count('pcm "hw:0,1"') != 1:
@@ -87,7 +97,8 @@ def stage_station(host: str) -> None:
             env = task.get('envs', [])
             if any(s.startswith('LD_PRELOAD=') for s in env):
                 raise RuntimeError('A custom LD_PRELOAD is already configured')
-            task['envs'] = env + [f'LD_PRELOAD={REMOTE}/capture_tap.so',
+            helper = 'vqe_tap' if MICROPHONE_MODE == 'vqe' else 'capture_tap'
+            task['envs'] = env + [f'LD_PRELOAD={REMOTE}/{helper}.so',
                                   f'ALICE_CAPTURE_SOCKET={REMOTE}/microphone.sock',
                                   f'ALICE_NATIVE_MUTE_FILE={REMOTE}/native-muted']
             patched += 1
@@ -100,7 +111,7 @@ def stage_station(host: str) -> None:
     ssh(host, f'umask 077; mkdir -p {REMOTE}')
     for name, text in files.items():
         ssh(host, f'umask 077; cat > {REMOTE}/{name}', data=text.encode())
-    for name in ['capture_tap.so', 'playback_worker.so', 'native_agent.so']:
+    for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'native_agent.so']:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=(ROOT / 'build' / name).read_bytes())
     ssh(host, f'chmod 700 {REMOTE}/profile.sh')
@@ -115,7 +126,14 @@ def stage_station(host: str) -> None:
 
 def has_shared_profile(host: str) -> bool:
     text = ssh(host, 'for p in $(pidof quasar_launcher2); do tr "\\000" " " </proc/$p/cmdline; done')
-    return f'{REMOTE}/launch.bridge.json'.encode() in text
+    if f'{REMOTE}/launch.bridge.json'.encode() not in text:
+        return False
+    # A running raw tap and a new VQE tap have different sample rates. Do not
+    # reuse the launcher just because its configuration pathname is the same.
+    mapped = ssh(host, 'for p in $(pidof maind); do '
+                 'sed -n "/alice-voice.*tap\\.so/p" /proc/$p/maps; done')
+    helper = 'vqe_tap' if MICROPHONE_MODE == 'vqe' else 'capture_tap'
+    return f'{REMOTE}/{helper}.so'.encode() in mapped
 
 
 def rms(data: bytes) -> float:
@@ -133,7 +151,7 @@ async def probe_station(host: str, seconds: int = 2) -> dict:
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     try:
-        data = await asyncio.wait_for(proc.stdout.readexactly(seconds * 48000 * 2), timeout=12)
+        data = await asyncio.wait_for(proc.stdout.readexactly(seconds * MICROPHONE_RATE * 2), timeout=12)
     except asyncio.TimeoutError as exc:
         proc.kill()
         await proc.wait()
@@ -146,7 +164,8 @@ async def probe_station(host: str, seconds: int = 2) -> dict:
         if proc.returncode is None:
             proc.terminate()
             await proc.wait()
-    return {'bytes': len(data), 'seconds': seconds, 'rms': round(rms(data), 6)}
+    return {'bytes': len(data), 'seconds': seconds, 'rate': MICROPHONE_RATE,
+            'source': MICROPHONE_MODE, 'rms': round(rms(data), 6)}
 
 
 async def prepare_station(host: str) -> None:
@@ -281,7 +300,8 @@ async def run_bridge(host: str) -> None:
     state = {'pid': os.getpid(), 'host': host, 'phase': 'starting', 'modules': [],
              'microphone': MIC_SOURCE, 'speaker': SPEAKER,
              'capture_bytes': 0, 'playback_bytes': 0, 'microphone_rms': 0.0,
-             'started_at': time.time()}
+             'started_at': time.time(), 'microphone_source': MICROPHONE_MODE,
+             'microphone_rate': MICROPHONE_RATE}
     save_state(state)
     try:
         await prepare_station(host)
@@ -300,12 +320,12 @@ async def run_bridge(host: str) -> None:
         capture = await spawn(*ssh_args(host),
                               f'exec socat -u UNIX-RECV:{REMOTE}/microphone.sock,unlink-early STDOUT')
         mic_player = await spawn('pacat', '--playback', '--raw', '--format=s16le',
-                                 '--rate=48000', '--channels=1', f'--device={MIC_BACKEND}',
+                                 f'--rate={MICROPHONE_RATE}', '--channels=1', f'--device={MIC_BACKEND}',
                                  '--latency-msec=20', '--process-time-msec=10',
                                  '--client-name=AliceVoiceBridge',
                                  '--stream-name=StationMicrophone')
-        state['microphone_pipe_bytes'] = limit_input_pipe(mic_player.stdin)
-        microphone = MicrophoneTransport(state, rms)
+        state['microphone_pipe_bytes'] = limit_input_pipe(mic_player.stdin, MICROPHONE_RATE // 100 * 2)
+        microphone = MicrophoneTransport(state, rms, sample_rate=MICROPHONE_RATE)
         speaker_monitor = await spawn('pacat', '--record', '--raw', '--format=s16le',
                                       '--rate=48000', '--channels=2',
                                       f'--device={SPEAKER}.monitor', '--latency-msec=20',
@@ -319,10 +339,11 @@ async def run_bridge(host: str) -> None:
         if await asyncio.wait_for(speaker.stdout.readexactly(6), 10) != b'READY\n':
             raise RuntimeError('Station playback worker did not initialize')
         playback_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
-        # Four blocks keep the existing 80 ms ALSA buffer supplied when the
-        # Wi-Fi round trip occasionally exceeds the old two-block window.
-        playback_slots = asyncio.Semaphore(4)
-        state['playback_window_ms'] = 80
+        # The window covers ALSA occupancy plus data and ACKs in transit.
+        # Eight blocks give Wi-Fi jitter headroom without enlarging ALSA or
+        # allowing an unbounded SSH backlog. Stale PC blocks are still dropped.
+        playback_slots = asyncio.Semaphore(8)
+        state['playback_window_ms'] = 160
         pending_playback = deque()
         state['playback_dropped_bytes'] = 0
         state['playback_queue_ms'] = 0

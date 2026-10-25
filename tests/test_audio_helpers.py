@@ -1,6 +1,7 @@
 """Host ALSA integration checks, using synthetic samples and the null device."""
 import array
 import os
+import re
 from pathlib import Path
 import select
 import socket
@@ -13,6 +14,42 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AudioHelpers(unittest.TestCase):
+    def test_recovery_refills_alsa_and_reports_the_error_without_losing_blocks(self):
+        # Simulate one underrun using real ALSA's null device; no speaker or
+        # microphone is opened. Also report a smaller hardware buffer to check
+        # that the start threshold fits the device instead of waiting forever.
+        source = r'''
+#include <dlfcn.h>
+int snd_pcm_get_params(void *pcm, unsigned long *buffer, unsigned long *period) {
+    *buffer = 960; *period = 240; return 0;
+}
+long snd_pcm_writei(void *pcm, const void *samples, unsigned long frames) {
+    static unsigned int calls;
+    if (++calls == 2) return -32;
+    long (*next)(void *, const void *, unsigned long) = dlsym(RTLD_NEXT, "snd_pcm_writei");
+    return next(pcm, samples, frames);
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='alice-recovery-test-') as temp:
+            fixture = Path(temp)
+            (fixture/'alsa_fixture.c').write_text(source)
+            subprocess.run(['clang', '-shared', '-fPIC', str(fixture/'alsa_fixture.c'),
+                            '-o', str(fixture/'alsa_fixture.so'), '-ldl'], check=True)
+            env = {**os.environ, 'ALICE_PLAYBACK_WORKER': '1',
+                   'ALICE_PLAYBACK_DEVICE': 'null',
+                   'LD_PRELOAD': str(ROOT/'build/playback_worker.host.so') + ':' +
+                                 str(fixture/'alsa_fixture.so')}
+            proc = subprocess.run(['aplay', '--version'], input=bytes(3840 * 6),
+                                  env=env, capture_output=True, timeout=3)
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+            self.assertEqual(proc.stdout, b'READY\nKUKKKK')
+            self.assertIn(b'ALICE_PLAYBACK_RECOVER error=-32', proc.stderr)
+            match = re.search(rb'buffer=(\d+) period=(\d+) prefill=(\d+)', proc.stderr)
+            self.assertIsNotNone(match)
+            buffer, period, prefill = map(int, match.groups())
+            self.assertGreater(prefill, 1)
+            self.assertLessEqual(prefill, buffer - period)
+
     def test_playback_acknowledges_complete_blocks_and_exits_on_eof(self):
         env = {**os.environ, 'LD_PRELOAD': str(ROOT / 'build/playback_worker.host.so'),
                'ALICE_PLAYBACK_WORKER': '1', 'ALICE_PLAYBACK_DEVICE': 'null'}

@@ -21,7 +21,7 @@ def main():
         compiler = os.environ.get('HOST_CC', 'clang') if target == 'host' else 'clang'
         if not shutil.which(compiler):
             raise SystemExit(f'Missing compiler: {compiler}')
-        for name in ['capture_tap', 'playback_worker', 'native_agent']:
+        for name in ['capture_tap', 'vqe_tap', 'playback_worker', 'native_agent']:
             destination = output / f'{name}{".host" if target == "host" else ""}.so'
             flags = ['-O2', '-fPIC', '-shared']
             if target == 'arm':

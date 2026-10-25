@@ -1,83 +1,22 @@
 #!/usr/bin/env python3
-"""Local spoken commands and private IPC for the dedicated ChatGPT window."""
+"""Browser voice controller driven by the station-native command agent."""
 import argparse
 import asyncio
-from collections import deque
 import contextlib
 import fcntl
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import time
 
-from bridge import ROOT, STATE_DIR, REMOTE, MIC_SOURCE, alive, read_state, dedicated_browser_uses_microphone, prepare_browser_audio, ssh, ssh_args, rms
+from bridge import ROOT, STATE_DIR, REMOTE, alive, read_state, dedicated_browser_uses_microphone, prepare_browser_audio, ssh_args
 from browser_control import Browser
-from native_control import cancel_frame, pause_frame, recognition_event, send_frame
 from mode_cue import play_closed
 from playback_guard import PlaybackGuard
 
 SOCKET = STATE_DIR / 'voice.sock'
 STATE = STATE_DIR / 'voice.json'
-PHRASES = {
-    'открой чат': 'open',
-    'создай чат': 'new', 'создай новый чат': 'new',
-    'закрой чат': 'close', 'выйди из чата': 'close', 'закончи разговор': 'close',
-}
-
-
-def intent(text):
-    value = re.sub(r'[^а-яё\s]', ' ', text.lower()).replace('ё', 'е')
-    value = ' '.join(value.split())
-    if not value.startswith('алиса '):
-        return None
-    return PHRASES.get(value.removeprefix('алиса ').removesuffix(' пожалуйста').strip())
-
-
-def recognized_intent(result):
-    action = intent(result.get('text', ''))
-    words = result.get('result', [])
-    confidences = [w.get('conf', 0) for w in words]
-    if (not action or len(words) < 3 or words[0].get('word') != 'алиса' or
-            confidences[0] < .75 or min(confidences) < .45 or
-            sum(confidences) / len(confidences) < .8):
-        return None
-    return action
-
-
-def resolve_command(action, words, context_action=None, active=False):
-    # "открой" and "закрой" differ by a short onset. Only resolve an
-    # uncertain opening as closing when ChatGPT is already active and a
-    # separate close/new-chat decoder confidently heard the closing command.
-    verb = 1 if words and words[0].get('word') == 'алиса' else 0
-    if (active and action == 'open' and context_action == 'close' and
-            len(words) > verb and words[verb].get('conf', 0) < .9):
-        return 'close'
-    return action
-
-
-class MarkedCommands:
-    """Keep an explicit wake marker across a short pause after 'Alice'."""
-    def __init__(self):
-        self.until = 0.0
-        self.marker = None
-
-    def consume(self, result, now=None):
-        now = time.monotonic() if now is None else now
-        text = result.get('text', '').strip()
-        words = result.get('result', [])
-        if text == 'алиса' and words and words[0].get('conf', 0) >= .75:
-            self.until, self.marker = now + 3, words[0]
-            return None
-        if text in PHRASES and self.marker and now <= self.until:
-            result = {'text': 'алиса ' + text, 'result': [self.marker] + words}
-        action = recognized_intent(result)
-        if action:
-            self.until, self.marker = 0, None
-        return action
-
-
 async def client(action):
     for attempt in range(60):
         try:
@@ -99,33 +38,30 @@ async def client(action):
 
 
 async def run():
-    from vosk import Model, KaldiRecognizer, SetLogLevel
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = (STATE_DIR / 'voice.lock').open('w')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        lock.close()
         return
-    SetLogLevel(-1)
-    model = Model(str(ROOT / 'models/vosk-model-small-ru-0.22'))
-    grammar = ['алиса ' + p for p in PHRASES] + ['[unk]']
-    recognizer = KaldiRecognizer(model, 16000, json.dumps(grammar, ensure_ascii=False))
-    recognizer.SetWords(True)
-    commands = MarkedCommands()
-    close_grammar = ['алиса ' + p for p, action in PHRASES.items() if action != 'open'] + ['[unk]']
-    close_recognizer = KaldiRecognizer(model, 16000, json.dumps(close_grammar, ensure_ascii=False))
-    close_recognizer.SetWords(True)
-    close_commands = MarkedCommands()
     browser = Browser()
     serial = asyncio.Lock()
     stop = asyncio.Event()
     for sig in [signal.SIGTERM, signal.SIGINT]:
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     status = {'pid': os.getpid(), 'phase': 'running', 'last_action': None,
-              'successful_actions': 0, 'voice_commands': 0}
+              'successful_actions': 0, 'voice_commands': 0,
+              'recognizer': 'yandex-native', 'recognition_location': 'station',
+              'recognition_service': 'Yandex cloud'}
     quiet_until = 0.0
     native_proc = None
+    native_ready = asyncio.Event()
     opening_chat = False
+    native_chat_mode = False
+    spoken_action = None
+    last_command_at = 0.0
+    voice_missing_since = None
 
     def save():
         temp = STATE.with_suffix('.new')
@@ -133,32 +69,32 @@ async def run():
         temp.chmod(0o600)
         temp.replace(STATE)
 
-    async def send_native(frame):
-        # Reuse the already connected local event stream: no SSH handshake is
-        # needed at the moment Alice is about to answer the switching command.
-        if native_proc and native_proc.returncode is None:
-            try:
-                native_proc.stdin.write(frame)
-                await asyncio.wait_for(native_proc.stdin.drain(), .5)
-                return
-            except (OSError, TimeoutError):
-                pass
-        await asyncio.to_thread(send_frame, read_state()['host'], frame)
+    async def send_native(command):
+        await asyncio.wait_for(native_ready.wait(), 12)
+        if not native_proc or native_proc.returncode is not None:
+            raise RuntimeError('The station command agent is unavailable')
+        native_proc.stdin.write((command + '\n').encode())
+        await asyncio.wait_for(native_proc.stdin.drain(), 1)
+
+    async def set_mode(chat):
+        nonlocal native_chat_mode
+        await send_native('CHAT' if chat else 'IDLE')
+        native_chat_mode = chat
 
     async def cancel_native():
-        await send_native(cancel_frame())
+        await send_native('CANCEL')
         status['native_dialogue_cancels'] = status.get('native_dialogue_cancels', 0) + 1
 
     async def pause_native():
-        await send_native(pause_frame())
+        await send_native('PAUSE')
         status['native_music_pauses'] = status.get('native_music_pauses', 0) + 1
 
-    async def start_voice(action):
+    async def start_voice(action, native_cancelled=False):
         nonlocal opening_chat
-        host = read_state()['host']
-        await cancel_native()
+        if not native_cancelled:
+            await cancel_native()
         await pause_native()
-        await asyncio.to_thread(ssh, host, f'touch {REMOTE}/native-muted')
+        await set_mode(True)
         opening_chat = True
         try:
             if action == 'new':
@@ -180,7 +116,7 @@ async def run():
             with contextlib.suppress(Exception):
                 await browser.close()
             with contextlib.suppress(Exception):
-                await asyncio.to_thread(ssh, host, f'rm -f {REMOTE}/native-muted')
+                await set_mode(False)
             raise
         finally:
             opening_chat = False
@@ -195,12 +131,10 @@ async def run():
             if action == 'close':
                 was_active = bool(browser.proc and browser.proc.poll() is None)
                 await browser.close()
-                if was_active:
+                if was_active and not spoken:
                     await cancel_native()
-                await asyncio.to_thread(ssh, read_state()['host'], f'rm -f {REMOTE}/native-muted')
+                await set_mode(False)
                 if was_active:
-                    # The browser has stopped capturing and the native input
-                    # is restored before we confirm the completed transition.
                     quiet_until = time.monotonic() + 2
                     try:
                         await play_closed()
@@ -211,10 +145,9 @@ async def run():
                 result = {'ok': True, 'action': action, 'voice_active': False}
             elif action == 'inspect':
                 await browser.launch()
-                return {'ok': True, 'buttons': await browser.buttons(),
-                        'health': await browser.health()}
+                return {'ok': True, 'buttons': await browser.buttons(), 'health': await browser.health()}
             elif action in ['open', 'new']:
-                result = await start_voice(action)
+                result = await start_voice(action, native_cancelled=spoken)
             else:
                 raise RuntimeError('Unknown action')
             status['last_action'] = action
@@ -237,24 +170,14 @@ async def run():
         writer.close()
         await writer.wait_closed()
 
-    SOCKET.unlink(missing_ok=True)
-    server = await asyncio.start_unix_server(handle, path=str(SOCKET), limit=8192)
-    SOCKET.chmod(0o600)
-    capture = await asyncio.create_subprocess_exec(
-        'pacat', '--record', '--raw', '--format=s16le', '--rate=16000', '--channels=1',
-        f'--device={MIC_SOURCE}', '--latency-msec=80', '--client-name=AliceVoiceCommands',
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    spoken_action = None
-    last_command_at = 0.0
-
-    def schedule(action, source):
+    def schedule(action):
         nonlocal spoken_action, last_command_at
         if ((spoken_action and not spoken_action.done()) or
-                time.monotonic() - last_command_at <= 2):
+                time.monotonic() - last_command_at <= 2 or time.monotonic() < quiet_until):
             return
         last_command_at = time.monotonic()
         status['last_recognized_action'] = action
-        status['command_source'] = source
+        status['command_source'] = 'native-station'
         save()
 
         async def dispatch():
@@ -268,107 +191,78 @@ async def run():
 
     async def watch_native():
         nonlocal native_proc
-        seen = deque(maxlen=64)
-        while True:
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *ssh_args(read_state()['host']),
-                    'exec socat STDIO TCP:127.0.0.1:9875,connect-timeout=2',
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL)
-                native_proc = proc
-                while True:
-                    size = int.from_bytes(await proc.stdout.readexactly(4), 'little')
-                    if not 0 < size <= 512 * 1024:
-                        raise ValueError('Invalid native event length')
-                    event = recognition_event(await proc.stdout.readexactly(size))
+        proc = await asyncio.create_subprocess_exec(
+            *ssh_args(read_state()['host']),
+            f'export LD_PRELOAD={REMOTE}/native_agent.so ALICE_NATIVE_AGENT=1; '
+            f'exec aplay --version --alice-native-agent {REMOTE}/native_agent.so',
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        native_proc = proc
+
+        async def heartbeats():
+            was_speaking = None
+            last_ping = 0.0
+            while True:
+                try:
+                    light = json.loads((STATE_DIR / 'indicator.json').read_text())
+                    speaking = bool(light.get('speaking') and time.time() - light.get('updated_at', 0) < 1)
+                except (OSError, ValueError):
+                    speaking = False
+                if speaking != was_speaking:
+                    proc.stdin.write(b'SPEAKING\n' if speaking else b'QUIET\n')
+                    was_speaking = speaking
+                if time.monotonic() - last_ping >= 1:
+                    proc.stdin.write(b'PING\n')
+                    last_ping = time.monotonic()
+                await asyncio.wait_for(proc.stdin.drain(), 1)
+                await asyncio.sleep(.15)
+
+        heartbeat = asyncio.create_task(heartbeats())
+        try:
+            while line := await proc.stdout.readline():
+                value = json.loads(line)
+                event = value.get('event')
+                if event == 'ready':
                     status['native_events_connected'] = True
-                    if not event:
-                        continue
-                    request, text = event
-                    if request in seen:
-                        continue
-                    seen.append(request)
-                    # Native final recognition is already tied to a wake-word
-                    # dialogue; its text normally excludes the wake marker.
-                    action = intent(text) or intent('алиса ' + text)
-                    if action and not read_state().get('native_alice_paused'):
-                        await cancel_native()
-                        schedule(action, 'native')
-            except (OSError, ValueError, asyncio.IncompleteReadError):
-                pass
-            finally:
-                native_proc = None
-                status['native_events_connected'] = False
-                if proc and proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.terminate()
-                    await proc.wait()
-            await asyncio.sleep(2)
-
-    async def listen():
-        was_reply = False
-
-        def receive_result(result, alternative=None):
-            action = commands.consume(result)
-            contextual = close_commands.consume(alternative or {})
-            action = resolve_command(action, result.get('result', []), contextual,
-                                     active=read_state().get('native_alice_paused', False))
-            if result.get('text'):
-                # Diagnostic labels only: keep unrelated recognized words and
-                # their contents out of state and logs.
-                known = {'алиса', '[unk]'} | {w for p in PHRASES for w in p.split()}
-                status['decoder_result'] = {
-                    'words': [w.get('word') if w.get('word') in known else '<other>'
-                              for w in result.get('result', [])],
-                    'confidences': [round(w.get('conf', 0), 3) for w in result.get('result', [])],
-                    'action': action,
-                    'closing_context': contextual,
-                }
+                    status['native_agent_pid'] = value.get('pid')
+                    native_ready.set()
+                    await set_mode(opening_chat or bool(browser.proc and browser.proc.poll() is None))
+                elif event == 'command' and value.get('action') in ['open', 'new', 'close']:
+                    # The station cancels its request before emitting this
+                    # event. Do not send a second stop during SDK cleanup.
+                    status['native_dialogue_cancels'] = status.get('native_dialogue_cancels', 0) + 1
+                    schedule(value['action'])
+                elif event == 'heartbeat_timeout':
+                    raise RuntimeError('The station command agent lost its heartbeat')
+                if event in ['ready', 'status', 'mode']:
+                    status['native_agent'] = {key: value.get(key) for key in
+                        ['pid', 'mode', 'recognition_starts', 'commands', 'speech_stops',
+                         'recognition_active', 'native_state', 'native_speech_events',
+                         'output_active', 'wake_blocks']}
                 save()
-            if action:
-                schedule(action, 'local')
-                recognizer.Reset()
-                close_recognizer.Reset()
+                if heartbeat.done():
+                    heartbeat.result()
+            raise RuntimeError('The station command agent disconnected')
+        finally:
+            native_ready.clear()
+            status['native_events_connected'] = False
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            if proc.returncode is None:
+                with contextlib.suppress(Exception):
+                    proc.stdin.write(b'IDLE\nSTOP\n')
+                    await asyncio.wait_for(proc.stdin.drain(), 1)
+                proc.stdin.close()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), 3)
+                if proc.returncode is None:
+                    proc.terminate()
+                    await proc.wait()
+            native_proc = None
 
-        while True:
-            block = await capture.stdout.readexactly(3200)
-            status['microphone_rms'] = round(rms(block), 6)
-            # Our own spoken reply must never issue commands. Continue draining
-            # capture during UI actions so old audio cannot reopen a closed chat.
-            try:
-                light = json.loads((STATE_DIR / 'indicator.json').read_text())
-                own_reply = bool(light.get('speaking') and
-                                 time.time() - light.get('updated_at', 0) < 1)
-            except (OSError, ValueError):
-                own_reply = False
-            if own_reply and not was_reply and not (spoken_action and not spoken_action.done()):
-                # The browser can begin its answer before Vosk's endpoint.
-                # Finalize the user's preceding utterance before suppressing
-                # our outgoing speech, rather than losing a close command.
-                receive_result(json.loads(recognizer.FinalResult()),
-                               json.loads(close_recognizer.FinalResult()))
-            was_reply = own_reply
-            if own_reply or time.monotonic() < quiet_until or (spoken_action and not spoken_action.done()):
-                status['decoder_gate'] = 'reply' if own_reply else 'transition'
-                recognizer.Reset()
-                close_recognizer.Reset()
-                continue
-            status['decoder_gate'] = 'listening'
-            primary_final = recognizer.AcceptWaveform(block)
-            closing_final = close_recognizer.AcceptWaveform(block)
-            # A constrained partial can turn "включи музыку" into "включи чат"
-            # until the utterance ends. Never cancel Alice on a partial. Exact
-            # native final events still provide the fast switching path.
-            if primary_final or closing_final:
-                primary = recognizer.Result() if primary_final else recognizer.FinalResult()
-                closing = close_recognizer.Result() if closing_final else close_recognizer.FinalResult()
-                receive_result(json.loads(primary), json.loads(closing))
-                recognizer.Reset()
-                close_recognizer.Reset()
-
-    listener = asyncio.create_task(listen())
+    SOCKET.unlink(missing_ok=True)
+    server = await asyncio.start_unix_server(handle, path=str(SOCKET), limit=8192)
+    SOCKET.chmod(0o600)
     native_watcher = asyncio.create_task(watch_native())
     music_guard = PlaybackGuard(
         lambda: opening_chat or bool(browser.proc and browser.proc.poll() is None and
@@ -380,8 +274,6 @@ async def run():
             bridge = read_state()
             if not alive(bridge) or bridge.get('phase') != 'running':
                 break
-            if listener.done():
-                listener.result()
             if native_watcher.done():
                 native_watcher.result()
             if music_watcher.done():
@@ -390,15 +282,26 @@ async def run():
                 status['native_music_pause_error'] = music_guard.error
             else:
                 status.pop('native_music_pause_error', None)
+            if (native_chat_mode and not opening_chat and
+                    (not browser.proc or browser.proc.poll() is not None)):
+                await set_mode(False)
+            if native_chat_mode and not opening_chat and not bridge.get('native_alice_paused'):
+                if voice_missing_since is None:
+                    voice_missing_since = time.monotonic()
+                elif time.monotonic() - voice_missing_since >= 3 and not serial.locked():
+                    await execute('close')
+                    status['command_source'] = 'web-call-ended'
+                    status['auto_closed_calls'] = status.get('auto_closed_calls', 0) + 1
+                    save()
+            else:
+                voice_missing_since = None
             if not serial.locked():
                 async with serial:
                     with contextlib.suppress(Exception):
                         await browser.remember_current()
             save()
-            await asyncio.sleep(.3)
+            await asyncio.sleep(.2)
     finally:
-        listener.cancel()
-        native_watcher.cancel()
         music_watcher.cancel()
         if spoken_action:
             spoken_action.cancel()
@@ -407,12 +310,14 @@ async def run():
         await server.wait_closed()
         SOCKET.unlink(missing_ok=True)
         await browser.close()
-        if capture.returncode is None:
-            capture.terminate()
-        await capture.wait()
-        await asyncio.gather(listener, native_watcher, music_watcher, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            if native_ready.is_set():
+                await set_mode(False)
+        native_watcher.cancel()
+        await asyncio.gather(native_watcher, music_watcher, return_exceptions=True)
         status['phase'] = 'stopped'
         save()
+        lock.close()
 
 
 if __name__ == '__main__':

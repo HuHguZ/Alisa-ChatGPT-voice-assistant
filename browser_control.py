@@ -260,6 +260,23 @@ class Browser:
             close_browser()
         if self.proc and self.proc.poll() is None:
             with contextlib.suppress(Exception):
+                # End the web call before closing its browser so a newly
+                # created conversation can finish acquiring its /c/ URL.
+                point = await self.evaluate("""(()=>{const b=Array.from(document.querySelectorAll('button')).find(b=>{
+                    const s=[b.getAttribute('aria-label'),b.title].join(' ');
+                    return !b.disabled&&b.getBoundingClientRect().width>0&&
+                        /end.*(call|voice)|exit.*voice|заверш.*(голос|разговор)|законч.*разговор/i.test(s)});
+                    if(!b)return null;const r=b.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()""")
+                if point:
+                    await self.command('Input.dispatchMouseEvent', {'type': 'mousePressed', **point,
+                                       'button': 'left', 'clickCount': 1}, page=True)
+                    await self.command('Input.dispatchMouseEvent', {'type': 'mouseReleased', **point,
+                                       'button': 'left', 'clickCount': 1}, page=True)
+                    for _ in range(15):
+                        await self.remember_current()
+                        if conversation_url(self.last_url):
+                            break
+                        await asyncio.sleep(.2)
                 await self.remember_current()
                 await self.command('Browser.close')
             try:

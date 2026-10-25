@@ -10,7 +10,7 @@ cleanup_receivers() {
         [ -r "/proc/$task_audio_pid/cmdline" ] || continue
         task_audio_command=$(tr '\000' ' ' < "/proc/$task_audio_pid/cmdline")
         case "$task_audio_command" in
-            *alice_mic*|*alice_shared_capture*|*"$BASE/microphone.sock"*|*"$BASE/playback.pid"*)
+            *alice_mic*|*alice_shared_capture*|*"$BASE/microphone.sock"*|*"$BASE/playback.pid"*|*"$BASE/native_agent.so"*)
                 kill -KILL "$task_audio_pid" 2>/dev/null || true
                 ;;
         esac

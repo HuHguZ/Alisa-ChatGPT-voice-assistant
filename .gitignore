@@ -29,6 +29,7 @@ id_ed25519*
 /test-tools/*
 !/test-tools/requirements.txt
 !/test-tools/verify_marker_resume.py
+!/test-tools/verify_web_close.py
 !/test-tools/verify_mode_cue.py
-!/test-tools/verify_ordinary_alice.py
 !/test-tools/measure_latency.py
+!/test-tools/native_input.c

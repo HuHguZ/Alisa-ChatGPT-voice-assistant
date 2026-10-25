@@ -100,8 +100,8 @@ def stage_station(host: str) -> None:
     ssh(host, f'umask 077; mkdir -p {REMOTE}')
     for name, text in files.items():
         ssh(host, f'umask 077; cat > {REMOTE}/{name}', data=text.encode())
-    for name in ['capture_tap.so', 'playback_worker.so']:
-        ssh(host, f'umask 077; cat > {REMOTE}/{name}',
+    for name in ['capture_tap.so', 'playback_worker.so', 'native_agent.so']:
+        ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=(ROOT / 'build' / name).read_bytes())
     ssh(host, f'chmod 700 {REMOTE}/profile.sh')
     backups = ROOT / 'backups'
@@ -203,7 +203,7 @@ def open_browser() -> None:
     state = read_state()
     if not alive(state) or state.get('phase') != 'running':
         raise RuntimeError('Start the audio bridge first')
-    result = command(str(ROOT / '.venv/bin/python'), str(ROOT / 'voice.py'), 'open', timeout=55)
+    result = command(sys.executable, str(ROOT / 'voice.py'), 'open', timeout=55)
     print(result.decode(), end='')
 
 
@@ -389,11 +389,9 @@ async def run_bridge(host: str) -> None:
             while not stop.is_set():
                 active = await asyncio.to_thread(dedicated_browser_uses_microphone)
                 if active != paused:
-                    action = f'touch {REMOTE}/native-muted' if active else f'rm -f {REMOTE}/native-muted'
-                    await asyncio.to_thread(ssh, host, action)
                     paused = active
                     state['native_alice_paused'] = paused
-                    print('Stock Alice recognition:', 'paused' if paused else 'resumed', flush=True)
+                    print('Native Alice replies:', 'handled by station agent' if paused else 'normal', flush=True)
                 await asyncio.sleep(0.5)
 
         streams = [asyncio.create_task(microphone.read(capture.stdout)),
@@ -410,12 +408,9 @@ async def run_bridge(host: str) -> None:
         state['phase'] = 'running'
         save_state(state)
         # Keep the controller and indicator in the same service lifecycle.
-        helper_python = ROOT / '.venv/bin/python'
-        if not helper_python.exists():
-            raise RuntimeError('The local voice-command environment is missing')
         for label, executable, script, args in [
             ('speaking indicator', sys.executable, 'indicator.py', []),
-            ('voice commands', str(helper_python), 'voice.py', ['run']),
+            ('voice commands', sys.executable, 'voice.py', ['run']),
         ]:
             helper = await asyncio.create_subprocess_exec(
                 executable, str(ROOT / script), *args,

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Temporary blue speaking light, controlled by PCM activity, with a lease."""
+"""GPT LED ownership and a speaking animation, with a remote lease."""
 import asyncio
+import colorsys
 import contextlib
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -14,6 +16,45 @@ from bridge import ROOT, REMOTE, SPEAKER, STATE_DIR, alive, read_state, rms, ssh
 STATE = STATE_DIR / 'indicator.json'
 
 
+def rainbow_frame(now):
+    """Three phase-shifted colors, a six-second orbit and gentle breathing."""
+    peak = 136 + 24 * math.sin(math.tau * (now % 2) / 2)
+    phase = (now % 6) / 6
+    return tuple(round(component * peak)
+                 for zone in range(3)
+                 for component in colorsys.hsv_to_rgb((phase + zone / 3) % 1, 1, 1))
+
+
+def light_command(chat_active, speaking, now, style):
+    if style not in ('rainbow', 'blue'):
+        raise ValueError('ALICE_LED_STYLE must be rainbow or blue')
+    if not chat_active:
+        return b'0\n'
+    if not speaking:
+        return b'F 0 0 0 0 0 0 0 0 0\n'
+    if style == 'blue':
+        return b'B\n'
+    return ('F ' + ' '.join(map(str, rainbow_frame(now))) + '\n').encode('ascii')
+
+
+def chat_mode(bridge):
+    if bridge.get('native_alice_paused'):
+        return True
+    # The native agent enters CHAT while the web call is still opening.
+    # A stale/dead controller must not leave the native LEDs suppressed.
+    try:
+        path = STATE_DIR / 'voice.json'
+        voice = json.loads(path.read_text())
+        process = Path(f'/proc/{int(voice["pid"])}/cmdline').read_bytes()
+        return bool(time.time() - path.stat().st_mtime < 3 and
+                    str(ROOT / 'voice.py').encode() in process and
+                    voice.get('phase') == 'running' and
+                    voice.get('native_events_connected') and
+                    voice.get('native_agent', {}).get('mode') == 'chat')
+    except (KeyError, TypeError, OSError, ValueError):
+        return False
+
+
 def save(value):
     temp = STATE.with_suffix('.new')
     temp.write_text(json.dumps(value, indent=2) + '\n')
@@ -22,6 +63,8 @@ def save(value):
 
 
 async def run():
+    style = os.environ.get('ALICE_LED_STYLE', 'rainbow')
+    light_command(False, False, 0, style)  # Validate before starting remote helpers.
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock = (STATE_DIR / 'indicator.lock').open('w')
     try:
@@ -65,13 +108,14 @@ async def run():
                 break
             if reader.done():
                 reader.result()
-            speaking = bool(bridge.get('native_alice_paused') and
-                            time.monotonic() - last_audio < .4)
-            control.stdin.write(b'B\n' if speaking else b'0\n')
+            chat_active = chat_mode(bridge)
+            speaking = bool(chat_active and time.monotonic() - last_audio < .4)
+            control.stdin.write(light_command(chat_active, speaking, time.monotonic(), style))
             await asyncio.wait_for(control.stdin.drain(), 2)
-            save({'pid': os.getpid(), 'phase': 'running', 'speaking': speaking,
+            save({'pid': os.getpid(), 'phase': 'running', 'speaking': speaking, 'style': style,
+                  'chat_active': chat_active,
                   'output_rms': round(level, 6), 'updated_at': time.time()})
-            await asyncio.sleep(.15)
+            await asyncio.sleep(.1)
     finally:
         reader.cancel()
         with contextlib.suppress(Exception):

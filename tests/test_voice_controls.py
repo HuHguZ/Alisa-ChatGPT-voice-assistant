@@ -14,6 +14,8 @@ class Indicator(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name) / 'plum'
+        gpio = root.parent / 'gpio'
+        gpio.write_text(' gpio-505 (                    |mute-switch         ) in  hi\n')
         for zone in range(1, 4):
             for index, color in enumerate(['red', 'green', 'blue']):
                 path = Path(f'{root}:{color}:ring{zone}')
@@ -22,7 +24,8 @@ class Indicator(unittest.TestCase):
                 trigger = triggers[(zone - 1) * 3 + index] if triggers else 'led_ring_fb'
                 (path / 'trigger').write_text(f'[{trigger}] none led_ring_fb heartbeat\n')
         proc = subprocess.Popen(['bash', str(ROOT / 'station/indicator.sh')],
-                                env={**os.environ, 'ALICE_LED_ROOT': str(root)},
+                                env={**os.environ, 'ALICE_LED_ROOT': str(root),
+                                     'ALICE_MUTE_GPIO_STATUS': str(gpio)},
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0)
         self.addCleanup(self.cleanup_process, proc)
@@ -99,6 +102,7 @@ class Indicator(unittest.TestCase):
         Path(f'{root}:blue:ring3/trigger').write_text('none led_ring_fb [heartbeat]\n')
         self.command(proc, b'0', b'STOCK')
         self.assertEqual(self.trigger_values(root), original[:-1] + ['heartbeat'])
+        self.assertEqual(self.values(root)[-1], 160)
 
     def test_red_preemption_restores_animation_without_overwriting_the_warning(self):
         proc, root = self.fixture((0, 0, 0))
@@ -117,6 +121,55 @@ class Indicator(unittest.TestCase):
         proc.stdin.close()
         self.assertEqual(proc.wait(timeout=3), 0)
         self.assertEqual(self.values(root), [100, 0, 0] * 3)
+
+    def test_rainbow_can_advance_from_its_own_red_zone_and_restore_the_original(self):
+        proc, root = self.fixture((4, 3, 2))
+        self.command(proc, b'F 160 0 0 0 160 0 0 0 160', b'FRAME')
+        self.assertEqual(self.values(root), [160, 0, 0, 0, 160, 0, 0, 0, 160])
+        self.assertEqual(self.trigger_values(root), ['none'] * 9)
+        self.command(proc, b'F 160 80 0 0 160 80 80 0 160', b'FRAME')
+        self.assertEqual(self.values(root), [160, 80, 0, 0, 160, 80, 80, 0, 160])
+        self.command(proc, b'0', b'STOCK')
+        self.assertEqual(self.values(root), [4, 3, 2] * 3)
+        self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
+
+    def test_silent_chat_keeps_native_animations_detached_until_exit(self):
+        proc, root = self.fixture((4, 3, 2))
+        self.command(proc, b'F 0 0 0 0 0 0 0 0 0', b'FRAME')
+        self.assertEqual(self.values(root), [0] * 9)
+        self.assertEqual(self.trigger_values(root), ['none'] * 9)
+        self.command(proc, b'0', b'STOCK')
+        self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
+
+    def test_hardware_mute_releases_a_dark_overlay_and_blocks_reacquisition(self):
+        proc, root = self.fixture((0, 0, 0))
+        self.command(proc, b'F 0 0 0 0 0 0 0 0 0', b'FRAME')
+        (root.parent/'gpio').write_text(' gpio-505 ( |mute-switch ) in lo\n')
+        self.command(proc, b'F 160 0 0 0 160 0 0 0 160', b'STOCK')
+        self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
+        proc.stdin.write(b'F 160 0 0 0 160 0 0 0 160\n')
+        proc.stdin.close()
+        self.assertEqual(proc.wait(timeout=3), 0)
+        self.assertEqual(self.values(root), [0] * 9)
+        self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
+
+    def test_missing_mute_state_releases_native_control(self):
+        proc, root = self.fixture((0, 0, 0))
+        self.command(proc, b'B', b'BLUE')
+        (root.parent/'gpio').unlink()
+        self.command(proc, b'F 0 0 0 0 0 0 0 0 0', b'STOCK')
+        self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
+
+    def test_malformed_frames_cannot_touch_the_leds(self):
+        for values in ['0 0 0', '256 0 0 0 0 0 0 0 0', '-1 0 0 0 0 0 0 0 0',
+                       '01 0 0 0 0 0 0 0 0', '* 0 0 0 0 0 0 0 0']:
+            with self.subTest(values=values):
+                proc, root = self.fixture((4, 3, 2))
+                proc.stdin.write(('F ' + values + '\n').encode())
+                proc.stdin.close()
+                self.assertEqual(proc.wait(timeout=3), 0)
+                self.assertEqual(self.values(root), [4, 3, 2] * 3)
+                self.assertEqual(self.trigger_values(root), ['led_ring_fb'] * 9)
 
 
 if __name__ == '__main__':

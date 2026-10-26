@@ -32,9 +32,15 @@ extern int clock_gettime(int, struct timespec *);
 struct value { const unsigned char *data; size_t size; u64 number; int wire; };
 struct agent {
     int fd, chat, recognizing, output_active, native_state;
-    char listening[37], seen[64][37];
+    char listening[37], current_request[37], seen[64][37];
     unsigned int seen_count, commands, recognition_starts, speech_stops, native_speech_events, wake_blocks;
+    unsigned int queue_clear_requests;
     double heartbeat;
+};
+enum alice_method_kind {
+    STOP_CONVERSATION = 3,
+    CANCEL_DIALOG_AND_CLEAR_QUEUE = 6,
+    STOP_TTS = 14
 };
 static volatile int stopping;
 
@@ -137,6 +143,16 @@ static int alice_method(struct agent *a, unsigned char kind) {
     return rpc(a, "AliceCapability", 8, method, sizeof(method));
 }
 
+static int clear_dialog_queue(struct agent *a, const char *request) {
+    /* Field 10 scopes both clear_queue and cancelDialog to the completed
+     * native request. Call only after BUSY: LISTENING still owns voice input. */
+    unsigned char method[40] = {8, CANCEL_DIALOG_AND_CLEAR_QUEUE};
+    size_t length = 2 + put_bytes(method + 2, 10, request, 36);
+    if (!rpc(a, "AliceCapability", 8, method, length)) return 0;
+    a->queue_clear_requests++;
+    return 1;
+}
+
 static int pause_player(struct agent *a) {
     const char source_id[] = "00000000-0000-4000-8000-000000000001";
     unsigned char source[100] = {8,14,16,3,24,1}, method[130] = {8,1};
@@ -190,9 +206,11 @@ static void status(struct agent *a, const char *event) {
     int n = snprintf(text, sizeof(text),
         "{\"event\":\"%s\",\"pid\":%d,\"mode\":\"%s\",\"recognition_starts\":%u,"
         "\"commands\":%u,\"speech_stops\":%u,\"recognition_active\":%d,"
-        "\"native_state\":%d,\"native_speech_events\":%u,\"output_active\":%d,\"wake_blocks\":%u}\n", event, getpid(),
+        "\"native_state\":%d,\"native_speech_events\":%u,\"output_active\":%d,\"wake_blocks\":%u,"
+        "\"queue_clear_requests\":%u}\n", event, getpid(),
         a->chat ? "chat" : "idle", a->recognition_starts, a->commands, a->speech_stops,
-        a->recognizing, a->native_state, a->native_speech_events, a->output_active, a->wake_blocks);
+        a->recognizing, a->native_state, a->native_speech_events, a->output_active, a->wake_blocks,
+        a->queue_clear_requests);
     if (n > 0 && (size_t)n < sizeof(text) && !output(1, text, (size_t)n)) stopping = 1;
 }
 
@@ -212,6 +230,7 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
     char id[37] = {0};
     if (bytes_field(data, size, 7, &identifier) && identifier.size == 36)
         memcpy(id, identifier.data, 36);
+    memcpy(a->current_request, id, sizeof(id));
     /* Keep the wake-triggered recognizer and its buffered speech intact.
      * Replacing it with START_RECOGNIZE can drop speech immediately after
      * the wake word and adds an unnecessary SDK session transition. */
@@ -221,14 +240,14 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
             a->recognizing = 0;
             a->wake_blocks++;
             memcpy(a->seen[a->seen_count++ % 64], id, sizeof(id));
-            return alice_method(a, 3);
+            return alice_method(a, STOP_CONVERSATION);
         }
         a->recognizing = 1;
         a->recognition_starts++;
     }
     if (a->chat && state == 2) {
         a->speech_stops++;
-        if (!alice_method(a, 14)) return 0;
+        if (!alice_method(a, STOP_TTS)) return 0;
     }
     if (state == 0) a->recognizing = 0;
     if (!bytes_field(data, size, 15, &request) ||
@@ -245,9 +264,11 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
     for (unsigned int i = 0; i < a->seen_count && i < 64; ++i)
         if (!memcmp(a->seen[i], id, 36)) return 1;
     memcpy(a->seen[a->seen_count++ % 64], id, sizeof(id));
-    /* Cancel the native answer locally, before a browser round trip. This
-     * also isolates unrelated Alice requests while ChatGPT owns the speaker. */
-    if (!alice_method(a, 3)) return 0;
+    /* Clear pending Alice responses for an exact opening command before the
+     * browser round trip. Other chat requests keep the existing stop path. */
+    if (action == 1 || action == 2) {
+        if (!clear_dialog_queue(a, id)) return 0;
+    } else if (!alice_method(a, STOP_CONVERSATION)) return 0;
     a->recognizing = 0;
     if (action) command_event(a, action);
     return 1;
@@ -263,7 +284,7 @@ static int handle_frame(struct agent *a, const unsigned char *data, size_t size)
 }
 
 static void restore(struct agent *a) {
-    if (a->recognizing) alice_method(a, 3);
+    if (a->recognizing) alice_method(a, STOP_CONVERSATION);
     a->chat = a->recognizing = 0;
     a->listening[0] = 0;
     unlink("/data/opt/alice-voice/native-muted");
@@ -276,7 +297,11 @@ static int control(struct agent *a, const char *line) {
     else if (!strcmp(line, "IDLE")) { restore(a); status(a, "mode"); }
     else if (!strcmp(line, "SPEAKING")) a->output_active = 1;
     else if (!strcmp(line, "QUIET")) a->output_active = 0;
-    else if (!strcmp(line, "CANCEL")) return alice_method(a, 3);
+    else if (!strcmp(line, "CANCEL")) return alice_method(a, STOP_CONVERSATION);
+    else if (!strcmp(line, "CLEAR_QUEUE")) {
+        if (a->native_state == 3 && a->current_request[0])
+            return clear_dialog_queue(a, a->current_request);
+    }
     else if (!strcmp(line, "PAUSE")) {
         /* Native playback controls share SDK focus with speech input. Let
          * an in-flight request finish before enforcing the music pause. */

@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,14 @@ class NativeAgent(unittest.TestCase):
         self.proc.stdin.write((line + '\n').encode())
         return self.message()
 
+    def wait_state(self, expected):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if self.control('PING')['native_state'] == expected:
+                return
+            time.sleep(.01)
+        self.fail(f'Native state did not become {expected}')
+
     def exact(self, length):
         data = b''
         while len(data) < length:
@@ -87,11 +96,50 @@ class NativeAgent(unittest.TestCase):
             self.peer.recv(1)
         frame = state_frame(3, 'открой чат', request='00000000-0000-4000-8000-000000000002', final=True)
         self.peer.sendall(frame)
-        self.assertEqual(self.method()[1], 3)
+        method = self.method()
+        self.assertEqual(method[1], 6)
+        self.assertEqual(method[10], b'00000000-0000-4000-8000-000000000002')
         self.assertEqual(self.message(), {'event': 'command', 'action': 'open'})
         self.peer.sendall(frame)
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
+        self.assertEqual(self.control('PING')['queue_clear_requests'], 1)
+
+    def test_opening_waits_for_busy_and_new_chat_clears_only_its_request(self):
+        request = '00000000-0000-4000-8000-000000000009'
+        self.peer.sendall(state_frame(1, 'создай новый чат', request=request, final=True))
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        self.peer.sendall(state_frame(3, 'создай новый чат', request=request, final=True))
+        method = self.method()
+        self.assertEqual(method[1], 6)
+        self.assertEqual(method[10], request.encode())
+        self.assertEqual(self.message(), {'event': 'command', 'action': 'new'})
+
+    def test_explicit_queue_clear_requires_busy_with_a_current_request(self):
+        self.proc.stdin.write(b'CLEAR_QUEUE\n')
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        self.peer.sendall(state_frame(1))
+        self.proc.stdin.write(b'CLEAR_QUEUE\n')
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        request = '00000000-0000-4000-8000-000000000008'
+        self.peer.sendall(state_frame(3, 'сколько времени', request=request, final=True))
+        # PING synchronizes the IPC state before the explicit control command.
+        self.wait_state(3)
+        self.proc.stdin.write(b'CLEAR_QUEUE\n')
+        method = self.method()
+        self.assertEqual(method[1], 6)
+        self.assertEqual(method[10], request.encode())
+        self.peer.sendall(state_frame(0))
+        self.wait_state(0)
+        self.peer.sendall(state_frame(3, request=''))
+        self.wait_state(3)
+        self.proc.stdin.write(b'CLEAR_QUEUE\n')
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        self.assertEqual(self.control('PING')['queue_clear_requests'], 1)
 
     def start_native_session(self):
         self.assertEqual(self.control('CHAT')['mode'], 'chat')

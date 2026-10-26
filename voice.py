@@ -238,7 +238,7 @@ async def run():
                     status['native_agent'] = {key: value.get(key) for key in
                         ['pid', 'mode', 'recognition_starts', 'commands', 'speech_stops',
                          'recognition_active', 'native_state', 'native_speech_events',
-                         'output_active', 'wake_blocks']}
+                         'output_active', 'wake_blocks', 'queue_clear_requests']}
                 save()
                 if heartbeat.done():
                     heartbeat.result()

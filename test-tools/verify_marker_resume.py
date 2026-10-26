@@ -16,8 +16,8 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from piper import PiperVoice
-from bridge import MIC_SOURCE, SPEAKER, STATE_DIR, dedicated_browser_streams, read_state, ssh
-from native_control import rpc_frame, send_frame
+from bridge import MIC_SOURCE, SPEAKER, STATE_DIR, dedicated_browser_streams, read_state, ssh, ssh_args
+from native_control import rpc_frame
 
 CONVERSATION = STATE_DIR / 'conversation.json'
 VOICE = STATE_DIR / 'voice.json'
@@ -60,6 +60,8 @@ def ready():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--native-only', action='store_true')
+    parser.add_argument('--open-only', action='store_true',
+                        help='Verify one native opening and its scoped queue clear')
     parser.add_argument('--baseline', action='store_true')
     parser.add_argument('--activate', action='store_true',
                         help='Start native conversation via IPC; do not test the wake-word detector')
@@ -72,6 +74,22 @@ def main():
               'test_input': 'Generated commands into native capture fixture; generated question into shared microphone source',
               'checks': []}
     voice = PiperVoice.load(str(ROOT / 'test-tools/piper/ru_RU-irina-medium.onnx'))
+    activation_proc = None
+
+    def close_activation():
+        nonlocal activation_proc
+        if activation_proc is None:
+            return
+        if activation_proc.poll() is None:
+            activation_proc.stdin.close()
+            try:
+                activation_proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                activation_proc.terminate()
+                activation_proc.wait(timeout=2)
+        elif activation_proc.stdin and not activation_proc.stdin.closed:
+            activation_proc.stdin.close()
+        activation_proc = None
 
     def quiet():
         since = time.monotonic()
@@ -102,6 +120,7 @@ def main():
             raise RuntimeError('Dedicated browser audio is muted or routed incorrectly')
 
     def speak(text, native=False):
+        nonlocal activation_proc
         # Keep the generated wake word identical across commands. Piper's
         # joined "Алиса, закрой чат" intonation is rejected by the native
         # spotter even when a time question from the same voice is accepted.
@@ -115,8 +134,17 @@ def main():
                              input=audio, stdout=subprocess.PIPE, check=True).stdout
         if native:
             if args.activate:
-                send_frame(read_state()['host'], rpc_frame(b'AliceCapability', 8, b'\x08\x02\x38\x01'))
-                time.sleep(.25)
+                # Keep the requesting IPC client alive until the native
+                # session finishes, and do not feed speech before LISTENING.
+                close_activation()
+                activation_proc = subprocess.Popen(
+                    ssh_args(read_state()['host']) +
+                    ['exec socat STDIO TCP:127.0.0.1:9875,connect-timeout=2'],
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                activation_proc.stdin.write(rpc_frame(b'AliceCapability', 8, b'\x08\x02\x38\x01'))
+                activation_proc.stdin.flush()
+                wait(lambda: read(VOICE).get('native_agent', {}).get('native_state') == 1, 8)
             # Requires the temporary native_input.c fixture build, never a
             # microphone recording or a command injected into the user's chat.
             ssh(read_state()['host'],
@@ -143,6 +171,7 @@ def main():
         report['stage'] = 'command_' + expected
         previous = read(VOICE).get('voice_commands', 0)
         previous_cancels = read(VOICE).get('native_dialogue_cancels', 0)
+        previous_clears = read(VOICE).get('native_agent', {}).get('queue_clear_requests', 0)
         speak(text, native=True)
         value = wait(lambda: (s if s.get('voice_commands', 0) > previous else None)
                      if (s := read(VOICE)) else None, 40)
@@ -156,6 +185,10 @@ def main():
         if expected == 'open':
             check['native_dialogue_cancels'] = value.get('native_dialogue_cancels', 0)
             check['passed'] = check['passed'] and check['native_dialogue_cancels'] > previous_cancels
+            after = wait(lambda: (s if s.get('native_agent', {}).get('queue_clear_requests', 0) > previous_clears else None)
+                         if (s := read(VOICE)) else None, 5)
+            check['queue_clear_requests_delta'] = after['native_agent']['queue_clear_requests'] - previous_clears
+            check['passed'] = check['passed'] and check['queue_clear_requests_delta'] == 1
         report['checks'].append(check)
         print(json.dumps(check, ensure_ascii=False), flush=True)
         if not check['passed']:
@@ -198,7 +231,12 @@ def main():
         shutil.copy2(fixture, capture_library)
         subprocess.run(['systemctl', '--user', 'restart', 'alice-voice-bridge.service'], check=True, timeout=60)
         wait(ready)
-        if args.baseline:
+        if args.open_only:
+            command('Алиса, открой чат.', 'open')
+            check_audio('native_open')
+            report['native_events_connected'] = read(VOICE).get('native_events_connected', False)
+            report['passed'] = all(c['passed'] for c in report['checks'])
+        elif args.baseline:
             ordinary_request(chat=False)
             ordinary_request(chat=False)
             report['passed'] = True
@@ -236,6 +274,7 @@ def main():
         report['command_diagnostic'] = read(VOICE).get('decoder_result')
         report['failed_native_agent'] = read(VOICE).get('native_agent')
     finally:
+        close_activation()
         try:
             control('close')
         except Exception:

@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/51602aef-c220-494d-ba76-0cc228cf6ee0
+
 # Alisa-ChatGPT-voice-assistant
 
 Голосовой мост между **Яндекс Станцией Лайт 2** и голосовым режимом **официальной веб-версии ChatGPT**. Микрофоны и динамик колонки передаются на Linux-ПК; ChatGPT работает в Chromium на отдельном виртуальном экране, без окна на рабочем столе.

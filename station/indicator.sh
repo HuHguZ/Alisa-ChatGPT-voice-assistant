@@ -4,7 +4,42 @@ set -eu
 LED=${ALICE_LED_ROOT:-/sys/class/leds/plum}
 owned=0
 saved=''
+saved_triggers=''
 blue=' 0 0 160 0 0 160 0 0 160'
+active_trigger() {
+    IFS= read -r task_led_available < "$1/trigger"
+    task_led_trigger=${task_led_available#*\[}
+    task_led_trigger=${task_led_trigger%%\]*}
+    case "$task_led_trigger" in
+        ''|*[!a-zA-Z0-9_:-]*) return 1 ;;
+    esac
+    printf '%s' "$task_led_trigger"
+}
+triggers() {
+    task_led_triggers=''
+    for task_led_zone in 1 2 3; do
+        for task_led_color in red green blue; do
+            task_led_trigger=$(active_trigger "$LED:$task_led_color:ring$task_led_zone")
+            task_led_triggers="$task_led_triggers $task_led_trigger"
+        done
+    done
+    printf '%s' "$task_led_triggers"
+}
+restore_triggers() {
+    set -- $saved_triggers
+    for task_led_zone in 1 2 3; do
+        for task_led_color in red green blue; do
+            task_led_path="$LED:$task_led_color:ring$task_led_zone"
+            task_led_current_trigger=$(active_trigger "$task_led_path")
+            # Writing brightness=0 detaches a Linux LED trigger. Restore it
+            # after the last brightness write, but respect a new trigger owner.
+            if [ "$task_led_current_trigger" = none ] && [ "$1" != none ]; then
+                printf '%s\n' "$1" > "$task_led_path/trigger"
+            fi
+            shift
+        done
+    done
+}
 frame() {
     task_led_frame=''
     for task_led_zone in 1 2 3; do
@@ -28,6 +63,7 @@ release() {
     if [ "$owned" = 1 ]; then
         task_led_current=$(frame)
         [ "$task_led_current" != "$blue" ] || paint "$saved"
+        restore_triggers
         owned=0
         printf 'STOCK\n'
     fi
@@ -44,13 +80,14 @@ while IFS= read -r -t 2 task_led_command; do
                 *)
                     set -- $task_led_current
                     if [ "$1" -gt 0 ] && [ "$2" = 0 ] && [ "$3" = 0 ]; then
-                        owned=0
+                        release
                         continue
                     fi
                     ;;
             esac
             if [ "$owned" = 0 ]; then
                 saved="$task_led_current"
+                saved_triggers=$(triggers)
                 owned=1
                 paint "$blue"
                 printf 'BLUE\n'

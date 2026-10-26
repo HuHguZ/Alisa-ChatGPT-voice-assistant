@@ -1,4 +1,4 @@
-https://github.com/user-attachments/assets/51602aef-c220-494d-ba76-0cc228cf6ee0
+https://github.com/user-attachments/assets/222b4d58-75bb-4ee6-bbb1-db9dd40330e0
 
 # Alisa-ChatGPT-voice-assistant
 

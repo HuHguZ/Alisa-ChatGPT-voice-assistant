@@ -5,11 +5,14 @@ import sys
 
 
 class SpeechGain:
-    def __init__(self, gain_db=6.0):
+    def __init__(self, gain_db=6.0, sample_rate=48000, channels=2):
         self.maximum_gain = 10 ** (gain_db / 20)
         self.gain = self.maximum_gain
         self.ceiling = int(32767 * .95)
         self.limited_blocks = 0
+        self.silent_samples = 0
+        self.silence_reset_samples = round(sample_rate * channels * .12)
+        self.silence_resets = 0
 
     def process(self, raw):
         values = array.array('h')
@@ -17,6 +20,15 @@ class SpeechGain:
         if sys.byteorder != 'little':
             values.byteswap()
         peak = max(map(abs, values), default=0)
+        # A previous phrase's peak must not fade in the next one. Reset only
+        # inside 120 ms of digital silence, never on an active speech block.
+        if peak <= 4:
+            self.silent_samples += len(values)
+            if self.silent_samples >= self.silence_reset_samples and self.gain < self.maximum_gain:
+                self.gain = self.maximum_gain
+                self.silence_resets += 1
+        else:
+            self.silent_samples = 0
         target = min(self.maximum_gain, self.ceiling / max(peak, 1))
         # Immediate reduction uses the whole existing 20 ms block as lookahead;
         # restore gain slowly after a peak to avoid audible pumping.

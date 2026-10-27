@@ -33,6 +33,29 @@ class Gain(unittest.TestCase):
         self.assertEqual(gain.limited_blocks, 1)
         self.assertEqual(gain.process(bytes(3840)), bytes(3840))
 
+    def test_next_phrase_starts_with_full_boost_after_a_silent_pause(self):
+        gain = SpeechGain()
+        gain.process(array.array('h', [32767, -32768] * 960).tobytes())
+        self.assertLess(gain.gain_db, 0)
+        for _ in range(6):  # 120 ms of stereo 48 kHz silence.
+            self.assertEqual(gain.process(bytes(3840)), bytes(3840))
+        phrase = array.array('h', [1000, -1000] * 960).tobytes()
+        first = array.array('h', gain.process(phrase))
+        self.assertEqual(first[0], round(1000 * 10 ** (6 / 20)))
+        self.assertEqual(gain.gain_db, 6.0)
+
+    def test_short_pause_keeps_slow_release_and_next_loud_block_still_limits(self):
+        gain = SpeechGain()
+        loud = array.array('h', [32767, -32768] * 960).tobytes()
+        gain.process(loud)
+        gain.process(bytes(3840))
+        quiet = array.array('h', gain.process(array.array('h', [1000] * 1920).tobytes()))
+        self.assertLess(quiet[0], round(1000 * 10 ** (6 / 20)))
+        for _ in range(6):
+            gain.process(bytes(3840))
+        limited = array.array('h', gain.process(loud))
+        self.assertLessEqual(max(map(abs, limited)), int(32767 * .95))
+
 
 class Resume(unittest.TestCase):
     URL = 'https://chatgpt.com/c/01234567-1234-5678-9abc-0123456789ab'

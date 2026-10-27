@@ -366,6 +366,7 @@ async def run_bridge(host: str) -> None:
         state['playback_boost_db'] = 6.0
         state['playback_gain_db'] = speech_gain.gain_db
         state['playback_limited_blocks'] = 0
+        state['playback_gain_silence_resets'] = 0
 
         async def read_playback() -> None:
             while True:
@@ -387,6 +388,7 @@ async def run_bridge(host: str) -> None:
                 block = speech_gain.process(block)
                 state['playback_gain_db'] = speech_gain.gain_db
                 state['playback_limited_blocks'] = speech_gain.limited_blocks
+                state['playback_gain_silence_resets'] = speech_gain.silence_resets
                 pending_playback.append(time.monotonic())
                 speaker.stdin.write(block)
                 await asyncio.wait_for(speaker.stdin.drain(), 3)

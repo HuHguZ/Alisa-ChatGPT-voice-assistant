@@ -131,7 +131,7 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                         await until(lambda: status().get('successful_actions') == index)
                         self.assertEqual(status()['last_action'], action)
                         await until(lambda: len(methods) >= index)
-                        self.assertEqual(methods, [6, 3, 6, 3][:index])
+                        self.assertEqual(methods, [6, 6, 6, 6][:index])
                         self.assertEqual(capture, action == 'open')
                         self.assertEqual(pauses, [1]*((index+1)//2))
                     self.assertEqual(cue.await_count, 2)
@@ -145,7 +145,7 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(status()['last_action'], 'close')
                     self.assertFalse(capture)
                     await until(lambda: len(methods) >= 6)
-                    self.assertEqual(methods, [6, 3, 6, 3, 6, 3])
+                    self.assertEqual(methods, [6, 6, 6, 6, 6, 3])
                     self.assertEqual(cue.await_count, 3)
                     # Failure to acquire focus must never open the browser.
                     await asyncio.sleep(2.1)

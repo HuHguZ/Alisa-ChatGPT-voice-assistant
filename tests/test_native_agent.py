@@ -153,13 +153,13 @@ class NativeAgent(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
         self.peer.sendall(state_frame(3, 'закрой чат', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.assertEqual(self.message(), {'event': 'command', 'action': 'close'})
 
     def test_unknown_recognition_cannot_start_native_music_or_switch_mode(self):
         self.start_native_session()
         self.peer.sendall(state_frame(3, 'включи музыку', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.peer.sendall(state_frame(0))
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
@@ -167,26 +167,46 @@ class NativeAgent(unittest.TestCase):
         self.assertEqual(report['mode'], 'chat')
         self.assertEqual(report['commands'], 0)
 
+    def test_chat_question_clears_queued_reply_before_speech_once(self):
+        self.start_native_session()
+        request = '00000000-0000-4000-8000-000000000019'
+        self.peer.sendall(state_frame(1, 'как дела', request=request, final=True))
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        final = state_frame(3, 'как дела', request=request, final=True)
+        self.peer.sendall(final)
+        method = self.method()
+        self.assertEqual((method[1], method.get(10)), (6, request.encode()))
+        self.peer.sendall(final)
+        with self.assertRaises(TimeoutError):
+            self.peer.recv(1)
+        # Retain STOP_TTS as a fallback for a response already in flight.
+        self.peer.sendall(state_frame(2, request=request))
+        self.assertEqual(self.method()[1], 14)
+        report = self.control('PING')
+        self.assertEqual((report['mode'], report['commands'],
+                          report['queue_clear_requests']), ('chat', 0, 1))
+
     def test_periodic_music_pause_does_not_interrupt_native_recognition(self):
         self.start_native_session()
         self.proc.stdin.write(b'PAUSE\n')
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
         self.peer.sendall(state_frame(3, 'закрой чат', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.assertEqual(self.message()['action'], 'close')
 
     def test_second_wake_after_unrelated_query_can_close_chat(self):
         self.start_native_session()
         self.peer.sendall(state_frame(3, 'сколько времени', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.peer.sendall(state_frame(0))
         request = '00000000-0000-4000-8000-000000000002'
         self.peer.sendall(state_frame(1, request=request))
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
         self.peer.sendall(state_frame(3, 'закрой чат', request=request, final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.assertEqual(self.message()['action'], 'close')
         self.assertEqual(self.control('PING')['recognition_starts'], 2)
 
@@ -196,7 +216,7 @@ class NativeAgent(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
         self.peer.sendall(state_frame(3, 'закрой чат', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.assertEqual(self.message()['action'], 'close')
         self.peer.sendall(state_frame(3, 'закрой чат', final=True))
         with self.assertRaises(TimeoutError):
@@ -223,7 +243,7 @@ class NativeAgent(unittest.TestCase):
             self.peer.recv(1)
         self.proc.stdin.write(b'SPEAKING\n')
         self.peer.sendall(state_frame(3, 'закрой чат', request='00000000-0000-4000-8000-000000000002', final=True))
-        self.assertEqual(self.method()[1], 3)
+        self.assertEqual(self.method()[1], 6)
         self.assertEqual(self.message()['action'], 'close')
 
     def test_backend_eof_cancels_owned_session_and_exits(self):

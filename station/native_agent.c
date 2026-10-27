@@ -484,9 +484,10 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
     for (unsigned int i = 0; i < a->seen_count && i < 64; ++i)
         if (!memcmp(a->seen[i], id, 36)) return 1;
     memcpy(a->seen[a->seen_count++ % 64], id, sizeof(id));
-    /* Clear pending Alice responses for an exact opening command before the
-     * browser round trip. Other chat requests keep the existing stop path. */
-    if (action == 1 || action == 2) {
+    /* Every request consumed by chat must discard its queued native reply,
+     * not just opening commands. STOP_CONVERSATION alone can leave that reply
+     * queued until SPEAKING, when STOP_TTS is already audibly late. */
+    if (a->chat || action == 1 || action == 2) {
         if (!clear_dialog_queue(a, id)) return 0;
     } else if (!alice_method(a, STOP_CONVERSATION)) return 0;
     a->recognizing = 0;

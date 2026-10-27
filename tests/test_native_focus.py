@@ -226,7 +226,7 @@ class NativeFocus(unittest.TestCase):
         size = int.from_bytes(self.exact(4), 'little')
         remote = fields(fields(self.exact(size))[252])
         self.assertEqual(remote[7], b'AliceCapability')
-        self.assertEqual(fields(remote[8])[1], 3)
+        self.assertEqual(fields(remote[8])[1], 6)
         self.assertEqual(self.message()['action'], 'close')
         self.peer.sendall(state_frame(0))
         time.sleep(.6)

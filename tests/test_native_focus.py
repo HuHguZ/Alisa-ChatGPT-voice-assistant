@@ -233,6 +233,37 @@ class NativeFocus(unittest.TestCase):
         self.assertFalse(select.select([self.peer], [], [], .05)[0])
         self.command('IDLE')
 
+    def test_delayed_completion_after_native_idle_still_reacquires_focus(self):
+        path, request = self.begin()
+        self.confirm(request)
+        self.peer.sendall(state_frame(1))
+        self.peer.sendall(state_frame(0))
+        time.sleep(.05)
+        # The native callback queue can deliver retirement after the IDLE.
+        self.peer.sendall(focus_event(request, completed=0))
+        self.assertEqual(self.message()['event'], 'focus_yielded')
+        method = self.method()
+        self.assertEqual((method[1], method[2]), (0, path))
+        self.confirm(fields(method[4])[4])
+
+    def test_close_while_reacquiring_cannot_be_undone_by_a_late_confirmation(self):
+        path, request = self.begin()
+        self.confirm(request)
+        self.peer.sendall(focus_event(request, completed=0))
+        self.assertEqual(self.message()['event'], 'focus_yielded')
+        self.peer.sendall(state_frame(0))
+        pending = self.method()
+        pending_request = fields(pending[4])[4]
+        self.assertEqual(self.command('IDLE')['mode'], 'idle')
+        stop = self.method()
+        self.assertEqual((stop[1], stop[2]), (1, path))
+        self.peer.sendall(focus_event(pending_request))
+        self.peer.sendall(state_frame(0))
+        time.sleep(.6)
+        status = self.command('PING')
+        self.assertEqual((status['mode'], status['focus_ready']), ('idle', 0))
+        self.assertFalse(select.select([self.peer], [], [], .05)[0])
+
     def test_acquire_timeout_removes_pending_activity(self):
         path, request = self.begin()
         deadline = time.monotonic() + 7

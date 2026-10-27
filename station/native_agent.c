@@ -50,6 +50,7 @@ struct agent {
     char focus_path[128];
     int focus_session_ready, focus_recovering, focus_wait_idle, focus_retries, focus_closing;
     unsigned int focus_yields, focus_reacquires;
+    unsigned int native_inputs, focus_input_at_start;
     double focus_idle_since, focus_retry_after;
 };
 
@@ -273,6 +274,7 @@ static int focus_start(struct agent *a, int slot) {
     n += put_bytes(method + n, 4, params, p);
     method[n++] = 40; method[n++] = 1; /* send_events, presence + value. */
     a->focus_owned[slot] = 1;
+    a->focus_input_at_start = a->native_inputs;
     a->focus_pending = slot;
     a->focus_deadline = seconds() + 5;
     return rpc(a, "AudioFilePlayerCapability", 12, method, n);
@@ -291,6 +293,13 @@ static void focus_yield(struct agent *a) {
     a->focus_ready = 0;
     a->focus_recovering = a->focus_wait_idle = 1;
     a->focus_idle_since = 0;
+    /* Completion can also arrive AFTER the IDLE of the intervening native
+     * input. That IDLE is already fresh; waiting for another would strand
+     * recovery. A cached IDLE from before the wake must not qualify. */
+    if (a->native_state == 0 && a->native_inputs != a->focus_input_at_start) {
+        a->focus_wait_idle = 0;
+        a->focus_idle_since = seconds();
+    }
     a->focus_retry_after = seconds() + .4;
     a->focus_yields++;
     status(a, "focus_yielded");
@@ -329,6 +338,7 @@ static int handle_focus(struct agent *a, const unsigned char *data, size_t size)
     } else if (slot == a->focus_current && flag.number == 1 && !a->focus_ready) {
         a->focus_ready = 1;
         a->focus_recovering = a->focus_wait_idle = 0;
+        a->focus_input_at_start = a->native_inputs;
         status(a, "focus");
     } else if (slot == a->focus_current && flag.number != 1) {
         /* The activity still exists while backgrounded; allow native focus
@@ -421,6 +431,7 @@ static void command_event(struct agent *a, int command) {
 static int handle_state(struct agent *a, const unsigned char *data, size_t size) {
     struct value request, identifier, text;
     int state = (int)int_field(data, size, 1);
+    if (state == 1 && a->native_state != 1) a->native_inputs++;
     if (state == 2 && a->native_state != 2) a->native_speech_events++;
     a->native_state = state;
     if (a->focus_recovering) {

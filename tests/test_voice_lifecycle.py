@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT))
 import voice
 from native_control import fields
 from test_native_agent import state_frame
+from test_native_focus import focus_event
+from audio_focus import silent_lease
 
 
 class Lifecycle(unittest.IsolatedAsyncioTestCase):
@@ -21,10 +23,13 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
         capture = False
         connected = asyncio.Event()
         methods = []
+        pauses = []
+        fail_focus = False
+        last_focus_request = None
         peer = None
 
         async def receive(reader, writer):
-            nonlocal peer
+            nonlocal peer, last_focus_request
             peer = writer
             connected.set()
             try:
@@ -33,6 +38,17 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                     remote = fields(fields(await reader.readexactly(size))[252])
                     if remote.get(7) == b'AliceCapability':
                         methods.append(fields(remote[8])[1])
+                        writer.write(state_frame(0))  # Cancel completes stock input.
+                        await writer.drain()
+                    elif remote.get(7) == b'PlaybackControlCapability':
+                        pauses.append(fields(remote[13])[1])
+                    elif remote.get(7) == b'AudioFilePlayerCapability':
+                        method = fields(remote[12])
+                        if method[1] == 0:
+                            last_focus_request = fields(method[4])[4]
+                            writer.write(focus_event(last_focus_request,
+                                                     completed=1 if fail_focus else None))
+                            await writer.drain()
             except asyncio.IncompleteReadError:
                 pass
             finally:
@@ -79,9 +95,13 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(asyncio.get_running_loop().remove_signal_handler, sig)
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
+            (state/'template.wav').write_bytes(silent_lease())
             config = {'host': 'fake', 'phase': 'running', 'pid': os.getpid()}
             command = ['/usr/bin/env', f'LD_PRELOAD={ROOT}/build/native_agent.host.so',
                        'ALICE_NATIVE_AGENT=1', f'ALICE_NATIVE_PORT={port}',
+                       'ALICE_NATIVE_FOCUS=1',
+                       f'ALICE_FOCUS_TEMPLATE={state}/template.wav',
+                       f'ALICE_FOCUS_DIRECTORY={state}',
                        f'ALICE_NATIVE_LOCK={state}/agent.lock', '/usr/bin/true']
             with patch.multiple(voice, STATE_DIR=state, STATE=state/'voice.json',
                                 SOCKET=state/'voice.sock', Browser=Browser), \
@@ -113,6 +133,7 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                         await until(lambda: len(methods) >= index)
                         self.assertEqual(methods, [6, 3, 6, 3][:index])
                         self.assertEqual(capture, action == 'open')
+                        self.assertEqual(pauses, [1]*((index+1)//2))
                     self.assertEqual(cue.await_count, 2)
                     await asyncio.sleep(2.1)
                     peer.write(state_frame(3, 'открой чат',
@@ -126,6 +147,27 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                     await until(lambda: len(methods) >= 6)
                     self.assertEqual(methods, [6, 3, 6, 3, 6, 3])
                     self.assertEqual(cue.await_count, 3)
+                    # Failure to acquire focus must never open the browser.
+                    await asyncio.sleep(2.1)
+                    fail_focus = True
+                    peer.write(state_frame(3, 'открой чат',
+                        request='00000000-0000-4000-8000-000000000006', final=True))
+                    await peer.drain()
+                    await until(lambda: 'audio focus' in status().get('error', ''))
+                    self.assertFalse(capture)
+                    self.assertEqual(status()['successful_actions'], 6)
+                    # Unexpected loss during an established call closes it.
+                    fail_focus = False
+                    await asyncio.sleep(2.1)
+                    peer.write(state_frame(3, 'открой чат',
+                        request='00000000-0000-4000-8000-000000000007', final=True))
+                    await peer.drain()
+                    await until(lambda: status().get('successful_actions') == 7)
+                    self.assertTrue(capture)
+                    peer.write(focus_event(last_focus_request, focused=False))
+                    await peer.drain()
+                    await until(lambda: status().get('command_source') == 'native-focus-lost')
+                    self.assertFalse(capture)
                 finally:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)

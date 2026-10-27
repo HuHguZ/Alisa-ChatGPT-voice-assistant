@@ -10,7 +10,7 @@ from pathlib import Path
 import signal
 import time
 
-from bridge import ROOT, STATE_DIR, REMOTE, alive, read_state, dedicated_browser_uses_microphone, prepare_browser_audio, ssh_args
+from bridge import ROOT, STATE_DIR, REMOTE, AUDIO_FOCUS_MODE, alive, read_state, dedicated_browser_uses_microphone, prepare_browser_audio, ssh_args
 from browser_control import Browser
 from mode_cue import play_closed
 from playback_guard import PlaybackGuard
@@ -57,6 +57,8 @@ async def run():
     quiet_until = 0.0
     native_proc = None
     native_ready = asyncio.Event()
+    focus_ready = asyncio.Event()
+    focus_error = asyncio.Event()
     opening_chat = False
     native_chat_mode = False
     spoken_action = None
@@ -78,8 +80,26 @@ async def run():
 
     async def set_mode(chat):
         nonlocal native_chat_mode
+        if chat:
+            focus_ready.clear()
+            focus_error.clear()
         await send_native('CHAT' if chat else 'IDLE')
         native_chat_mode = chat
+        if chat and AUDIO_FOCUS_MODE == 'native':
+            ready = asyncio.create_task(focus_ready.wait())
+            failed = asyncio.create_task(focus_error.wait())
+            try:
+                done, _ = await asyncio.wait([ready, failed], timeout=6,
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if not done or focus_error.is_set() or not focus_ready.is_set():
+                    raise RuntimeError('Station did not confirm native DIALOG audio focus')
+                status.pop('audio_focus_error', None)
+            finally:
+                ready.cancel()
+                failed.cancel()
+                await asyncio.gather(ready, failed, return_exceptions=True)
+        if not chat:
+            focus_ready.clear()
 
     async def cancel_native():
         await send_native('CANCEL')
@@ -94,9 +114,9 @@ async def run():
         if not native_cancelled:
             await cancel_native()
         await pause_native()
-        await set_mode(True)
         opening_chat = True
         try:
+            await set_mode(True)
             if action == 'new':
                 await browser.close()
                 browser.forget_conversation()
@@ -193,7 +213,8 @@ async def run():
         nonlocal native_proc
         proc = await asyncio.create_subprocess_exec(
             *ssh_args(read_state()['host']),
-            f'export LD_PRELOAD={REMOTE}/native_agent.so ALICE_NATIVE_AGENT=1; '
+            f'export LD_PRELOAD={REMOTE}/native_agent.so ALICE_NATIVE_AGENT=1 '
+            f'ALICE_NATIVE_FOCUS={int(AUDIO_FOCUS_MODE == "native")}; '
             f'exec aplay --version --alice-native-agent {REMOTE}/native_agent.so',
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL)
@@ -226,7 +247,10 @@ async def run():
                     status['native_events_connected'] = True
                     status['native_agent_pid'] = value.get('pid')
                     native_ready.set()
-                    await set_mode(opening_chat or bool(browser.proc and browser.proc.poll() is None))
+                    # Reading focus confirmations is this task's responsibility;
+                    # never await a confirmation from inside the reader itself.
+                    chat = opening_chat or bool(browser.proc and browser.proc.poll() is None)
+                    await send_native('CHAT' if chat else 'IDLE')
                 elif event == 'command' and value.get('action') in ['open', 'new', 'close']:
                     # The station cancels its request before emitting this
                     # event. Do not send a second stop during SDK cleanup.
@@ -234,17 +258,28 @@ async def run():
                     schedule(value['action'])
                 elif event == 'heartbeat_timeout':
                     raise RuntimeError('The station command agent lost its heartbeat')
-                if event in ['ready', 'status', 'mode']:
+                if event in ['ready', 'status', 'mode', 'focus', 'focus_error']:
                     status['native_agent'] = {key: value.get(key) for key in
                         ['pid', 'mode', 'recognition_starts', 'commands', 'speech_stops',
                          'recognition_active', 'native_state', 'native_speech_events',
-                         'output_active', 'wake_blocks', 'queue_clear_requests']}
+                         'output_active', 'wake_blocks', 'queue_clear_requests',
+                         'focus_enabled', 'focus_ready', 'focus_acquires',
+                         'focus_releases', 'focus_guard_pid']}
+                    if value.get('focus_ready'):
+                        focus_ready.set()
+                    else:
+                        focus_ready.clear()
+                    if event == 'focus_error':
+                        focus_error.set()
+                        status['audio_focus_error'] = 'Native focus lost or activity expired'
                 save()
                 if heartbeat.done():
                     heartbeat.result()
             raise RuntimeError('The station command agent disconnected')
         finally:
             native_ready.clear()
+            focus_ready.clear()
+            focus_error.set()
             status['native_events_connected'] = False
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
@@ -265,8 +300,9 @@ async def run():
     SOCKET.chmod(0o600)
     native_watcher = asyncio.create_task(watch_native())
     music_guard = PlaybackGuard(
-        lambda: opening_chat or bool(browser.proc and browser.proc.poll() is None and
-                                    read_state().get('native_alice_paused')), pause_native)
+        lambda: AUDIO_FOCUS_MODE == 'pause' and (
+            opening_chat or bool(browser.proc and browser.proc.poll() is None and
+                                 read_state().get('native_alice_paused'))), pause_native)
     music_watcher = asyncio.create_task(music_guard.run())
     save()
     try:
@@ -282,6 +318,11 @@ async def run():
                 status['native_music_pause_error'] = music_guard.error
             else:
                 status.pop('native_music_pause_error', None)
+            status['audio_focus_mode'] = AUDIO_FOCUS_MODE
+            if (AUDIO_FOCUS_MODE == 'native' and focus_error.is_set() and
+                    native_chat_mode and not serial.locked()):
+                await execute('close')
+                status['command_source'] = 'native-focus-lost'
             if (native_chat_mode and not opening_chat and
                     (not browser.proc or browser.proc.poll() is not None)):
                 await set_mode(False)

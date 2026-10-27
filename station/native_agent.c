@@ -28,14 +28,33 @@ struct timespec { long sec, nsec; };
 struct local_address { unsigned short family, port; unsigned char address[4], pad[8]; };
 extern int poll(struct pollfd *, unsigned long, int);
 extern int clock_gettime(int, struct timespec *);
+extern int pipe2(int *, int);
+extern int fork(void);
+extern int setsid(void);
+extern int waitpid(int, int *, int);
+extern int getsockopt(int, int, int, void *, unsigned int *);
+extern int link(const char *, const char *);
 
 struct value { const unsigned char *data; size_t size; u64 number; int wire; };
 struct agent {
-    int fd, chat, recognizing, output_active, native_state;
+    int fd, chat, recognizing, output_active, native_state, pause_pending;
     char listening[37], current_request[37], seen[64][37];
     unsigned int seen_count, commands, recognition_starts, speech_stops, native_speech_events, wake_blocks;
     unsigned int queue_clear_requests;
     double heartbeat;
+    int focus_enabled, focus_current, focus_pending, focus_owned[2], focus_ready;
+    unsigned int focus_serial, focus_acquires, focus_releases;
+    char focus_request[2][37];
+    double focus_deadline;
+    int focus_guard_fd, focus_guard_pid, focus_cleanup_failed;
+    char focus_path[128];
+};
+
+/* A single looped native session retains its activity across replay. A
+ * separate local guardian holds our lock, and stops only our file on pipe EOF
+ * or10s without a heartbeat, even when this agent is killed or blocked. */
+static const char *focus_paths[2] = {
+    "/data/opt/alice-voice/focus-0.wav", "/data/opt/alice-voice/focus-1.wav"
 };
 enum alice_method_kind {
     STOP_CONVERSATION = 3,
@@ -43,6 +62,7 @@ enum alice_method_kind {
     STOP_TTS = 14
 };
 static volatile int stopping;
+static void stop_signal(int unused);
 
 static double seconds(void) {
     struct timespec t;
@@ -202,16 +222,142 @@ int alice_native_command(const unsigned char *text, size_t length) {
 }
 
 static void status(struct agent *a, const char *event) {
-    char text[512];
+    char text[768];
     int n = snprintf(text, sizeof(text),
         "{\"event\":\"%s\",\"pid\":%d,\"mode\":\"%s\",\"recognition_starts\":%u,"
         "\"commands\":%u,\"speech_stops\":%u,\"recognition_active\":%d,"
         "\"native_state\":%d,\"native_speech_events\":%u,\"output_active\":%d,\"wake_blocks\":%u,"
-        "\"queue_clear_requests\":%u}\n", event, getpid(),
+        "\"queue_clear_requests\":%u,\"focus_enabled\":%d,\"focus_ready\":%d,"
+        "\"focus_acquires\":%u,\"focus_releases\":%u,"
+        "\"focus_guard_pid\":%d}\n", event, getpid(),
         a->chat ? "chat" : "idle", a->recognition_starts, a->commands, a->speech_stops,
         a->recognizing, a->native_state, a->native_speech_events, a->output_active, a->wake_blocks,
-        a->queue_clear_requests);
+        a->queue_clear_requests, a->focus_enabled, a->focus_ready,
+        a->focus_acquires, a->focus_releases, a->focus_guard_pid);
     if (n > 0 && (size_t)n < sizeof(text) && !output(1, text, (size_t)n)) stopping = 1;
+}
+
+static int focus_stop(struct agent *a, int slot) {
+    unsigned char method[192] = {8, 1};
+    size_t n = 2 + put_bytes(method + 2, 2, a->focus_path, strlen(a->focus_path));
+    a->focus_owned[slot] = 0;
+    a->focus_request[slot][0] = 0; /* Ignore late completion/focus events. */
+    a->focus_releases++;
+    int good = rpc(a, "AudioFilePlayerCapability", 12, method, n);
+    if (!good) a->focus_cleanup_failed = 1;
+    return good;
+}
+
+static int focus_release(struct agent *a) {
+    int good = 1;
+    for (int i = 0; i < 2; ++i)
+        if (a->focus_owned[i] && !focus_stop(a, i)) good = 0;
+    a->focus_current = a->focus_pending = -1;
+    a->focus_ready = 0;
+    return good;
+}
+
+static int focus_start(struct agent *a, int slot) {
+    unsigned char method[220] = {8, 0}, params[48] = {8,1,16,1};
+    /* Unique per acquisition, including replacements in the same slot. */
+    snprintf(a->focus_request[slot], 37, "47505446-0000-4000-%04x-%012x",
+             (unsigned int)getpid() & 65535, ++a->focus_serial);
+    size_t p = 4 + put_bytes(params + 4, 4, a->focus_request[slot], 36);
+    size_t n = 2 + put_bytes(method + 2, 2, a->focus_path, strlen(a->focus_path));
+    method[n++] = 24; method[n++] = 1; /* DIALOG channel. */
+    n += put_bytes(method + n, 4, params, p);
+    method[n++] = 40; method[n++] = 1; /* send_events, presence + value. */
+    a->focus_owned[slot] = 1;
+    a->focus_pending = slot;
+    a->focus_deadline = seconds() + 5;
+    return rpc(a, "AudioFilePlayerCapability", 12, method, n);
+}
+
+static int handle_focus(struct agent *a, const unsigned char *data, size_t size) {
+    struct value event, directive_event, directive, request, audio, flag, completed;
+    if (!a->focus_enabled || !bytes_field(data, size, 17, &event) ||
+        !bytes_field(event.data, event.size, 1, &directive_event) ||
+        !bytes_field(directive_event.data, directive_event.size, 1, &directive) ||
+        !bytes_field(directive.data, directive.size, 4, &request) || request.size != 36)
+        return 1;
+    int slot = -1;
+    for (int i = 0; i < 2; ++i)
+        if (a->focus_owned[i] && !memcmp(request.data, a->focus_request[i], 36)) slot = i;
+    if (slot < 0) return 1;
+    if (field(directive_event.data, directive_event.size, 4, &completed)) {
+        /* Unexpected completion, even SUCCESS, means the activity ended. */
+        focus_release(a); a->chat = 0; status(a, "focus_error");
+        return 1;
+    }
+    if (!bytes_field(event.data, event.size, 3, &audio) ||
+        int_field(audio.data, audio.size, 1) != 6 ||
+        !field(audio.data, audio.size, 17, &flag) || flag.wire != 0) return 1;
+    if (slot == a->focus_pending && flag.number == 1) {
+        a->focus_current = slot; a->focus_pending = -1; a->focus_ready = 1;
+        a->focus_acquires++;
+        status(a, "focus");
+    } else if (slot == a->focus_current && flag.number != 1) {
+        focus_release(a); a->chat = 0; status(a, "focus_error");
+    }
+    return 1;
+}
+
+static int focus_tick(struct agent *a) {
+    if (!a->focus_enabled || !a->chat) return 1;
+    if (a->focus_pending >= 0) {
+        if (seconds() >= a->focus_deadline) {
+            focus_release(a); a->chat = 0; status(a, "focus_error");
+        }
+    }
+    return 1;
+}
+
+static int start_focus_guard(struct agent *a, int lock, const struct local_address *address) {
+    int pipe[2];
+    if (pipe2(pipe, 02000000 | 04000) < 0) return 0;
+    int child = fork();
+    if (child < 0) { close(pipe[0]); close(pipe[1]); return 0; }
+    if (child) {
+        close(pipe[0]); a->focus_guard_fd = pipe[1]; a->focus_guard_pid = child;
+        return 1;
+    }
+    /* Do not keep SSH stdio or the parent's Remoting socket alive. The lock
+     * stays inherited until cleanup, so a replacement agent cannot race us. */
+    close(pipe[1]); close(a->fd); close(0); close(1); close(2);
+    setsid();
+    signal(1, stop_signal); signal(15, stop_signal); signal(2, stop_signal);
+    int disarmed = 0;
+    while (!stopping) {
+        struct pollfd watched = {pipe[0], 1, 0};
+        int ready = poll(&watched, 1, 10000);
+        if (ready < 0 && *__errno_location() == 4) continue;
+        if (ready <= 0) break;
+        char input[128]; long n = read(pipe[0], input, sizeof(input));
+        if (n <= 0) break;
+        for (long i = 0; i < n; ++i) if (input[i] == 'D') disarmed = 1;
+        if (disarmed) break;
+    }
+    if (!disarmed) {
+        /* Bounded nonblocking connect; the tiny stop frame fits the empty
+         * send buffer. Retain the lock until this attempt has finished. */
+        int fd = socket(2, 1 | 04000, 0);
+        if (fd >= 0) {
+            int connected = connect(fd, address, sizeof(*address)) == 0;
+            if (!connected && *__errno_location() == 115) {
+                struct pollfd writable = {fd, 4, 0};
+                int error = -1; unsigned int length = sizeof(error);
+                if (poll(&writable, 1, 2000) > 0 &&
+                    getsockopt(fd, 1, 4, &error, &length) == 0 && error == 0) connected = 1;
+            }
+            if (connected) {
+                a->fd = fd;
+                focus_stop(a, 0);
+            }
+            close(fd);
+        }
+    }
+    unlink(a->focus_path);
+    close(pipe[0]); close(lock); _exit(0);
 }
 
 static void command_event(struct agent *a, int command) {
@@ -227,6 +373,10 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
     int state = (int)int_field(data, size, 1);
     if (state == 2 && a->native_state != 2) a->native_speech_events++;
     a->native_state = state;
+    if (state == 0 && a->pause_pending) {
+        a->pause_pending = 0;
+        if (!pause_player(a)) return 0;
+    }
     char id[37] = {0};
     if (bytes_field(data, size, 7, &identifier) && identifier.size == 36)
         memcpy(id, identifier.data, 36);
@@ -277,6 +427,15 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
 static int handle_frame(struct agent *a, const unsigned char *data, size_t size) {
     struct value state;
     if (!field(data, size, 0, &state)) return 1;
+    if (int_field(data, size, 253) == 210 && bytes_field(data, size, 252, &state)) {
+        struct value object;
+        const char name[] = "AudioFilePlayerCapability";
+        if (!field(state.data, state.size, 0, &object)) return 1;
+        if (bytes_field(state.data, state.size, 7, &object) &&
+            object.size == sizeof(name) - 1 && !memcmp(object.data, name, object.size))
+            return handle_focus(a, state.data, state.size);
+        return 1;
+    }
     if (int_field(data, size, 253) != 3 || !bytes_field(data, size, 252, &state)) return 1;
     struct value ignored;
     if (!field(state.data, state.size, 0, &ignored)) return 1;
@@ -284,16 +443,24 @@ static int handle_frame(struct agent *a, const unsigned char *data, size_t size)
 }
 
 static void restore(struct agent *a) {
+    if (a->focus_enabled) focus_release(a);
     if (a->recognizing) alice_method(a, STOP_CONVERSATION);
     a->chat = a->recognizing = 0;
+    a->pause_pending = 0;
     a->listening[0] = 0;
     unlink("/data/opt/alice-voice/native-muted");
 }
 
 static int control(struct agent *a, const char *line) {
     a->heartbeat = seconds();
+    if (a->focus_enabled && write(a->focus_guard_fd, "P", 1) != 1) return 0;
     if (!strcmp(line, "PING")) status(a, "status");
-    else if (!strcmp(line, "CHAT")) { a->chat = 1; status(a, "mode"); }
+    else if (!strcmp(line, "CHAT")) {
+        a->chat = 1;
+        if (a->focus_enabled && a->focus_current < 0 && a->focus_pending < 0 &&
+            !focus_start(a, 0)) return 0;
+        status(a, "mode");
+    }
     else if (!strcmp(line, "IDLE")) { restore(a); status(a, "mode"); }
     else if (!strcmp(line, "SPEAKING")) a->output_active = 1;
     else if (!strcmp(line, "QUIET")) a->output_active = 0;
@@ -306,6 +473,9 @@ static int control(struct agent *a, const char *line) {
         /* Native playback controls share SDK focus with speech input. Let
          * an in-flight request finish before enforcing the music pause. */
         if (a->native_state != 1 && a->native_state != 3) return pause_player(a);
+        /* Native focus replaces the periodic pause guard. Preserve the single
+         * requested pause until this voice input finishes, without a timer. */
+        if (a->focus_enabled) a->pause_pending = 1;
     }
     else if (!strcmp(line, "STOP")) stopping = 1;
     return 1;
@@ -332,6 +502,10 @@ __attribute__((constructor)) static void run_agent(void) {
     struct local_address address =
         {2, (unsigned short)((port >> 8) | (port << 8)), {127,0,0,1}, {0}};
     struct agent a = {0}; a.fd = -1; a.native_state = -1;
+    a.focus_current = a.focus_pending = -1;
+    a.focus_guard_fd = -1;
+    const char *native_focus = getenv("ALICE_NATIVE_FOCUS");
+    a.focus_enabled = native_focus && !strcmp(native_focus, "1");
     for (int attempt = 0; attempt < 40 && !stopping; ++attempt) {
         a.fd = socket(2, 1, 0);
         if (a.fd >= 0 && connect(a.fd, &address, sizeof(address)) == 0) break;
@@ -339,12 +513,27 @@ __attribute__((constructor)) static void run_agent(void) {
         a.fd = -1; poll(0, 0, 250);
     }
     if (a.fd < 0) _exit(2);
+    if (a.focus_enabled) {
+        struct timespec stamp;
+        if (clock_gettime(1, &stamp) < 0) _exit(2);
+        int written = snprintf(a.focus_path, sizeof(a.focus_path),
+                 "/data/opt/alice-voice/focus-%08x-%08lx.wav", (unsigned int)getpid(), stamp.nsec);
+        /* Tests may point the template at an ordinary temporary WAV. */
+        const char *source = getenv("ALICE_FOCUS_TEMPLATE");
+        const char *directory = getenv("ALICE_FOCUS_DIRECTORY");
+        if (directory) written = snprintf(a.focus_path, sizeof(a.focus_path),
+                              "%s/focus-%08x-%08lx.wav", directory, (unsigned int)getpid(), stamp.nsec);
+        if (written <= 0 || (size_t)written >= sizeof(a.focus_path) || a.focus_path[0] != '/') _exit(2);
+        if (link(source ? source : focus_paths[0], a.focus_path) < 0) _exit(2);
+        if (!start_focus_guard(&a, lock, &address)) { unlink(a.focus_path); _exit(2); }
+    }
     a.heartbeat = seconds(); status(&a, "ready");
     static unsigned char input[512 * 1024 + 4];
     size_t used = 0, control_used = 0;
     char line[64];
     int good = 1;
     while (!stopping && good) {
+        if (!focus_tick(&a)) break;
         if (seconds() - a.heartbeat > 8) {
             restore(&a); status(&a, "heartbeat_timeout"); break;
         }
@@ -376,6 +565,15 @@ __attribute__((constructor)) static void run_agent(void) {
             }
         }
     }
-    restore(&a); close(a.fd); close(lock);
+    restore(&a);
+    if (a.focus_guard_fd >= 0) {
+        if (!a.focus_cleanup_failed) write(a.focus_guard_fd, "D", 1);
+        close(a.focus_guard_fd);
+        for (int i = 0; i < 100; ++i) {
+            if (waitpid(a.focus_guard_pid, 0, 1) != 0) break;
+            poll(0, 0, 10);
+        }
+    }
+    close(a.fd); close(lock);
     _exit(good ? 0 : 2);
 }

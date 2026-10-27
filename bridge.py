@@ -19,6 +19,7 @@ import sys
 import time
 from audio_gain import SpeechGain
 from microphone_transport import MicrophoneTransport, limit_input_pipe
+from audio_focus import FOCUS_FILES, MAIND_SHA256, silent_lease
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / '.local/state/alice-voice-bridge'
@@ -34,6 +35,9 @@ if MICROPHONE_MODE not in ('raw', 'vqe'):
 MICROPHONE_RATE = 16000 if MICROPHONE_MODE == 'vqe' else 48000
 # Undocumented float32/channel enum ABI: refuse an unverified library build.
 VQE_LIBRARY_SHA256 = 'fa7ad1544fe9ddfccedcf15acc031768345b0b8c7333bc1c0b47bc476dd4152f'
+AUDIO_FOCUS_MODE = os.environ.get('ALICE_AUDIO_FOCUS_MODE', 'native')
+if AUDIO_FOCUS_MODE not in ('native', 'pause'):
+    raise ValueError('ALICE_AUDIO_FOCUS_MODE must be native or pause')
 
 
 def command(*args: str, timeout: float = 15, data: bytes | None = None) -> bytes:
@@ -81,6 +85,10 @@ def save_state(state: dict) -> None:
 
 def stage_station(host: str) -> None:
     """Add a nonblocking capture tap to a separate, temporary launcher profile."""
+    if AUDIO_FOCUS_MODE == 'native':
+        digest = ssh(host, 'sha256sum /system/vendor/quasar/maind').decode().split()[0]
+        if digest != MAIND_SHA256:
+            raise RuntimeError('Unverified native audio-focus protocol for this maind build')
     if MICROPHONE_MODE == 'vqe':
         digest = ssh(host, 'sha256sum /system/vendor/quasar/libs/libyandex_evil.so').decode().split()[0]
         if digest != VQE_LIBRARY_SHA256:
@@ -111,6 +119,10 @@ def stage_station(host: str) -> None:
     ssh(host, f'umask 077; mkdir -p {REMOTE}')
     for name, text in files.items():
         ssh(host, f'umask 077; cat > {REMOTE}/{name}', data=text.encode())
+    lease = silent_lease()
+    for name in FOCUS_FILES:
+        ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
+            data=lease)
     for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'native_agent.so']:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=(ROOT / 'build' / name).read_bytes())

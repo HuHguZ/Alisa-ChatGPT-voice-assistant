@@ -362,10 +362,30 @@ async def run_bridge(host: str) -> None:
         state['playback_gain_db'] = speech_gain.gain_db
         state['playback_limited_blocks'] = 0
         state['playback_gain_silence_resets'] = 0
+        state['playback_monitor_gap_ms_max'] = 0
+        state['playback_ack_gap_ms_max'] = 0
+        state['event_loop_lag_ms_max'] = 0
+
+        def timing(label, delay, threshold=.06):
+            value = round(delay * 1000, 1)
+            key = label + '_ms_max'
+            state[key] = max(state.get(key, 0), value)
+            if delay > threshold:
+                print(f'ALICE_HOST_TIMING {label}_ms={value}', flush=True)
+
+        async def event_loop_timing():
+            while True:
+                expected = time.monotonic() + .02
+                await asyncio.sleep(.02)
+                timing('event_loop_lag', max(0, time.monotonic() - expected))
 
         async def read_playback() -> None:
+            previous = time.monotonic()
             while True:
                 block = await speaker_monitor.stdout.readexactly(3840)
+                now = time.monotonic()
+                timing('playback_monitor_gap', now - previous)
+                previous = now
                 if playback_queue.full():
                     playback_queue.get_nowait()
                     state['playback_dropped_bytes'] += 3840
@@ -374,7 +394,9 @@ async def run_bridge(host: str) -> None:
 
         async def write_playback() -> None:
             while True:
+                before = time.monotonic()
                 await asyncio.wait_for(playback_slots.acquire(), 3)
+                timing('playback_slot_wait', time.monotonic() - before)
                 queued_at, block = await playback_queue.get()
                 if time.monotonic() - queued_at > 0.18:
                     state['playback_dropped_bytes'] += len(block)
@@ -386,11 +408,17 @@ async def run_bridge(host: str) -> None:
                 state['playback_gain_silence_resets'] = speech_gain.silence_resets
                 pending_playback.append(time.monotonic())
                 speaker.stdin.write(block)
+                before = time.monotonic()
                 await asyncio.wait_for(speaker.stdin.drain(), 3)
+                timing('playback_pipe_wait', time.monotonic() - before)
 
         async def acknowledge_playback() -> None:
+            previous = time.monotonic()
             while True:
                 ack = await speaker.stdout.readexactly(1)
+                now = time.monotonic()
+                timing('playback_ack_gap', now - previous)
+                previous = now
                 if ack not in [b'K', b'U'] or not pending_playback:
                     raise RuntimeError('Invalid station playback acknowledgement')
                 ack_ms = round((time.monotonic() - pending_playback.popleft()) * 1000, 1)
@@ -429,6 +457,7 @@ async def run_bridge(host: str) -> None:
                    asyncio.create_task(read_playback()),
                    asyncio.create_task(write_playback()),
                    asyncio.create_task(acknowledge_playback()),
+                   asyncio.create_task(event_loop_timing()),
                    asyncio.create_task(native_voice_mode())]
         stop_task = asyncio.create_task(stop.wait())
         tasks = streams + [asyncio.create_task(status()), stop_task]

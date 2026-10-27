@@ -12,6 +12,14 @@ extern long write(int, const void *, size_t);
 extern int *__errno_location(void);
 extern void _exit(int);
 extern int snprintf(char *, size_t, const char *, ...);
+struct timespec { long sec, nsec; };
+extern int clock_gettime(int, struct timespec *);
+
+static long elapsed_us(const struct timespec *before) {
+    struct timespec after;
+    if (clock_gettime(1, &after) < 0) return 0;
+    return (after.sec - before->sec) * 1000000L + (after.nsec - before->nsec) / 1000;
+}
 
 static int transfer(int fd, void *data, size_t count, int output) {
     unsigned char *p = data;
@@ -78,7 +86,12 @@ __attribute__((constructor)) static void run_worker(void) {
     char ready[] = "READY\n";
     if (transfer(1, ready, sizeof(ready) - 1, 1) < 0) fail();
     short samples[960 * 2];
-    while (transfer(0, samples, sizeof(samples), 0) == 0) {
+    while (1) {
+        struct timespec input_at = {0}, write_at = {0};
+        clock_gettime(1, &input_at);
+        if (transfer(0, samples, sizeof(samples), 0) < 0) break;
+        long input_us = elapsed_us(&input_at);
+        clock_gettime(1, &write_at);
         frames_t offset = 0;
         int recovered = 0;
         while (offset < 960) {
@@ -86,7 +99,8 @@ __attribute__((constructor)) static void run_worker(void) {
             if (n < 0) {
                 if (recover(pcm, (int)n, 1) < 0) fail();
                 length = snprintf(diagnostic, sizeof(diagnostic),
-                    "ALICE_PLAYBACK_RECOVER error=%ld\n", n);
+                    "ALICE_PLAYBACK_RECOVER error=%ld input_us=%ld write_us=%ld\n",
+                    n, input_us, elapsed_us(&write_at));
                 if (length > 0 && (size_t)length < sizeof(diagnostic))
                     transfer(2, diagnostic, (size_t)length, 1);
                 recovered = 1;
@@ -94,6 +108,13 @@ __attribute__((constructor)) static void run_worker(void) {
             }
             if (n == 0) fail();
             offset += (frames_t)n;
+        }
+        long write_us = elapsed_us(&write_at);
+        if (input_us > 40000 || write_us > 40000) {
+            length = snprintf(diagnostic, sizeof(diagnostic),
+                "ALICE_PLAYBACK_TIMING input_us=%ld write_us=%ld\n", input_us, write_us);
+            if (length > 0 && (size_t)length < sizeof(diagnostic))
+                transfer(2, diagnostic, (size_t)length, 1);
         }
         char ack = recovered ? 'U' : 'K';
         if (transfer(1, &ack, 1, 1) < 0) break;

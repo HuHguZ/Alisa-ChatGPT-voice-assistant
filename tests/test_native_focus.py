@@ -176,18 +176,62 @@ class NativeFocus(unittest.TestCase):
         finally:
             os.kill(self.proc.pid, signal.SIGCONT)
 
-    def test_focus_loss_and_completion_restore_idle(self):
+    def test_background_focus_yields_without_stopping_activity_and_can_return(self):
         path, request = self.begin()
         self.confirm(request)
         self.peer.sendall(focus_event(request, focused=False))
         result = self.message()
         self.assertEqual((result['event'], result['mode'], result['focus_ready']),
-                         ('focus_error', 'idle', 0))
-        self.assertEqual(self.method()[2], path)
+                         ('focus_yielded', 'chat', 0))
+        self.assertFalse(select.select([self.peer], [], [], .05)[0])
+        self.peer.sendall(focus_event(request))
+        self.assertEqual(self.message()['focus_ready'], 1)
+        self.assertEqual(self.command('PING')['mode'], 'chat')
+
+    def test_wake_completion_before_listening_preserves_chat_and_reacquires_after_idle(self):
+        path, request = self.begin()
+        self.confirm(request)
+        # Firmware can retire the file before broadcasting LISTENING.
+        self.peer.sendall(focus_event(request, completed=0))
+        yielded = self.message()
+        self.assertEqual((yielded['event'], yielded['mode']), ('focus_yielded', 'chat'))
+        self.peer.sendall(state_frame(1))
+        time.sleep(.7)
+        self.assertFalse(select.select([self.peer], [], [], .05)[0])
+        self.assertEqual(self.command('PING')['mode'], 'chat')
+        self.peer.sendall(state_frame(3))
+        time.sleep(.1)
+        self.assertFalse(select.select([self.peer], [], [], .05)[0])
+        self.peer.sendall(state_frame(0))
+        method = self.method()
+        self.assertEqual((method[1], method[2]), (0, path))
+        new_request = fields(method[4])[4]
+        self.assertNotEqual(new_request, request)
+        self.confirm(new_request)
+        self.assertEqual(self.command('PING')['mode'], 'chat')
+
+    def test_initial_failed_acquisition_still_restores_idle(self):
         path, request = self.begin()
         self.peer.sendall(focus_event(request, completed=1))
         self.assertEqual(self.message()['event'], 'focus_error')
         self.assertEqual(self.method()[2], path)
+
+    def test_voice_close_after_wake_yield_remains_an_explicit_command(self):
+        path, request = self.begin()
+        self.confirm(request)
+        self.peer.sendall(focus_event(request, completed=0))
+        self.assertEqual(self.message()['event'], 'focus_yielded')
+        self.peer.sendall(state_frame(1))
+        self.peer.sendall(state_frame(3, 'закрой чат', final=True))
+        size = int.from_bytes(self.exact(4), 'little')
+        remote = fields(fields(self.exact(size))[252])
+        self.assertEqual(remote[7], b'AliceCapability')
+        self.assertEqual(fields(remote[8])[1], 3)
+        self.assertEqual(self.message()['action'], 'close')
+        self.peer.sendall(state_frame(0))
+        time.sleep(.6)
+        self.assertFalse(select.select([self.peer], [], [], .05)[0])
+        self.command('IDLE')
 
     def test_acquire_timeout_removes_pending_activity(self):
         path, request = self.begin()

@@ -156,7 +156,7 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                     await until(lambda: 'audio focus' in status().get('error', ''))
                     self.assertFalse(capture)
                     self.assertEqual(status()['successful_actions'], 6)
-                    # Unexpected loss during an established call closes it.
+                    # Wake-related loss/completion must preserve the web call.
                     fail_focus = False
                     await asyncio.sleep(2.1)
                     peer.write(state_frame(3, 'открой чат',
@@ -166,8 +166,30 @@ class Lifecycle(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(capture)
                     peer.write(focus_event(last_focus_request, focused=False))
                     await peer.drain()
-                    await until(lambda: status().get('command_source') == 'native-focus-lost')
+                    await until(lambda: status().get('native_agent', {}).get('focus_recovering'))
+                    await asyncio.sleep(.5)
+                    self.assertTrue(capture)
+                    self.assertEqual(status()['successful_actions'], 7)
+                    peer.write(focus_event(last_focus_request, completed=0))
+                    peer.write(state_frame(1))
+                    await peer.drain()
+                    await asyncio.sleep(.6)
+                    self.assertTrue(capture)
+                    before = last_focus_request
+                    peer.write(state_frame(0))
+                    await peer.drain()
+                    await until(lambda: last_focus_request != before and
+                                status().get('native_agent', {}).get('focus_ready'))
+                    self.assertTrue(capture)
+                    await asyncio.sleep(.5)
+                    peer.write(state_frame(1,
+                        request='00000000-0000-4000-8000-000000000008'))
+                    peer.write(state_frame(3, 'закрой чат',
+                        request='00000000-0000-4000-8000-000000000008', final=True))
+                    await peer.drain()
+                    await until(lambda: status().get('successful_actions') == 8)
                     self.assertFalse(capture)
+                    self.assertEqual(status()['last_action'], 'close')
                 finally:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)

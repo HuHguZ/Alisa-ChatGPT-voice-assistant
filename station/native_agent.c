@@ -48,6 +48,9 @@ struct agent {
     double focus_deadline;
     int focus_guard_fd, focus_guard_pid, focus_cleanup_failed;
     char focus_path[128];
+    int focus_session_ready, focus_recovering, focus_wait_idle, focus_retries, focus_closing;
+    unsigned int focus_yields, focus_reacquires;
+    double focus_idle_since, focus_retry_after;
 };
 
 /* A single looped native session retains its activity across replay. A
@@ -229,11 +232,13 @@ static void status(struct agent *a, const char *event) {
         "\"native_state\":%d,\"native_speech_events\":%u,\"output_active\":%d,\"wake_blocks\":%u,"
         "\"queue_clear_requests\":%u,\"focus_enabled\":%d,\"focus_ready\":%d,"
         "\"focus_acquires\":%u,\"focus_releases\":%u,"
-        "\"focus_guard_pid\":%d}\n", event, getpid(),
+        "\"focus_guard_pid\":%d,\"focus_recovering\":%d,"
+        "\"focus_yields\":%u,\"focus_reacquires\":%u}\n", event, getpid(),
         a->chat ? "chat" : "idle", a->recognition_starts, a->commands, a->speech_stops,
         a->recognizing, a->native_state, a->native_speech_events, a->output_active, a->wake_blocks,
         a->queue_clear_requests, a->focus_enabled, a->focus_ready,
-        a->focus_acquires, a->focus_releases, a->focus_guard_pid);
+        a->focus_acquires, a->focus_releases, a->focus_guard_pid,
+        a->focus_recovering, a->focus_yields, a->focus_reacquires);
     if (n > 0 && (size_t)n < sizeof(text) && !output(1, text, (size_t)n)) stopping = 1;
 }
 
@@ -273,6 +278,24 @@ static int focus_start(struct agent *a, int slot) {
     return rpc(a, "AudioFilePlayerCapability", 12, method, n);
 }
 
+static void focus_fail(struct agent *a) {
+    focus_release(a);
+    a->chat = a->pause_pending = a->focus_session_ready = a->focus_recovering = 0;
+    status(a, "focus_error");
+}
+
+static void focus_yield(struct agent *a) {
+    /* FilePlayer may complete BEFORE the Alice LISTENING event arrives. Keep
+     * user chat intent independent of focus and wait for a fresh IDLE event;
+     * issuing another local directive now can cancel native recognition. */
+    a->focus_ready = 0;
+    a->focus_recovering = a->focus_wait_idle = 1;
+    a->focus_idle_since = 0;
+    a->focus_retry_after = seconds() + .4;
+    a->focus_yields++;
+    status(a, "focus_yielded");
+}
+
 static int handle_focus(struct agent *a, const unsigned char *data, size_t size) {
     struct value event, directive_event, directive, request, audio, flag, completed;
     if (!a->focus_enabled || !bytes_field(data, size, 17, &event) ||
@@ -285,8 +308,13 @@ static int handle_focus(struct agent *a, const unsigned char *data, size_t size)
         if (a->focus_owned[i] && !memcmp(request.data, a->focus_request[i], 36)) slot = i;
     if (slot < 0) return 1;
     if (field(directive_event.data, directive_event.size, 4, &completed)) {
-        /* Unexpected completion, even SUCCESS, means the activity ended. */
-        focus_release(a); a->chat = 0; status(a, "focus_error");
+        if (!a->focus_session_ready) { focus_fail(a); return 1; }
+        int was_pending = slot == a->focus_pending;
+        a->focus_owned[slot] = 0;
+        a->focus_request[slot][0] = 0;
+        a->focus_current = a->focus_pending = -1;
+        if (was_pending && ++a->focus_retries >= 3) { focus_fail(a); return 1; }
+        focus_yield(a);
         return 1;
     }
     if (!bytes_field(event.data, event.size, 3, &audio) ||
@@ -294,10 +322,18 @@ static int handle_focus(struct agent *a, const unsigned char *data, size_t size)
         !field(audio.data, audio.size, 17, &flag) || flag.wire != 0) return 1;
     if (slot == a->focus_pending && flag.number == 1) {
         a->focus_current = slot; a->focus_pending = -1; a->focus_ready = 1;
+        a->focus_session_ready = 1;
+        a->focus_recovering = a->focus_wait_idle = a->focus_retries = 0;
         a->focus_acquires++;
         status(a, "focus");
+    } else if (slot == a->focus_current && flag.number == 1 && !a->focus_ready) {
+        a->focus_ready = 1;
+        a->focus_recovering = a->focus_wait_idle = 0;
+        status(a, "focus");
     } else if (slot == a->focus_current && flag.number != 1) {
-        focus_release(a); a->chat = 0; status(a, "focus_error");
+        /* The activity still exists while backgrounded; allow native focus
+         * restoration instead of stopping/recreating it during voice input. */
+        if (a->focus_ready) focus_yield(a);
     }
     return 1;
 }
@@ -306,8 +342,22 @@ static int focus_tick(struct agent *a) {
     if (!a->focus_enabled || !a->chat) return 1;
     if (a->focus_pending >= 0) {
         if (seconds() >= a->focus_deadline) {
-            focus_release(a); a->chat = 0; status(a, "focus_error");
+            if (!a->focus_session_ready) focus_fail(a);
+            else if (a->native_state == 0) {
+                focus_release(a);
+                if (++a->focus_retries >= 3) focus_fail(a);
+                else {
+                    focus_yield(a);
+                    a->focus_wait_idle = 0;
+                    a->focus_idle_since = seconds();
+                }
+            }
         }
+    } else if (a->focus_recovering && !a->focus_closing && !a->focus_wait_idle &&
+               a->focus_current < 0 && a->native_state == 0 &&
+               seconds() >= a->focus_retry_after && seconds() - a->focus_idle_since >= .4) {
+        a->focus_reacquires++;
+        return focus_start(a, 0);
     }
     return 1;
 }
@@ -373,6 +423,15 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
     int state = (int)int_field(data, size, 1);
     if (state == 2 && a->native_state != 2) a->native_speech_events++;
     a->native_state = state;
+    if (a->focus_recovering) {
+        if (state == 0) {
+            if (a->focus_wait_idle || a->focus_idle_since == 0) a->focus_idle_since = seconds();
+            a->focus_wait_idle = 0;
+        } else {
+            a->focus_wait_idle = 1;
+            a->focus_idle_since = 0;
+        }
+    }
     if (state == 0 && a->pause_pending) {
         a->pause_pending = 0;
         if (!pause_player(a)) return 0;
@@ -420,6 +479,7 @@ static int handle_state(struct agent *a, const unsigned char *data, size_t size)
         if (!clear_dialog_queue(a, id)) return 0;
     } else if (!alice_method(a, STOP_CONVERSATION)) return 0;
     a->recognizing = 0;
+    if (action == 3) a->focus_closing = 1;
     if (action) command_event(a, action);
     return 1;
 }
@@ -447,6 +507,8 @@ static void restore(struct agent *a) {
     if (a->recognizing) alice_method(a, STOP_CONVERSATION);
     a->chat = a->recognizing = 0;
     a->pause_pending = 0;
+    a->focus_session_ready = a->focus_recovering = a->focus_wait_idle = 0;
+    a->focus_retries = a->focus_closing = 0;
     a->listening[0] = 0;
     unlink("/data/opt/alice-voice/native-muted");
 }
@@ -456,8 +518,10 @@ static int control(struct agent *a, const char *line) {
     if (a->focus_enabled && write(a->focus_guard_fd, "P", 1) != 1) return 0;
     if (!strcmp(line, "PING")) status(a, "status");
     else if (!strcmp(line, "CHAT")) {
+        if (!a->chat) a->focus_session_ready = 0;
         a->chat = 1;
-        if (a->focus_enabled && a->focus_current < 0 && a->focus_pending < 0 &&
+        a->focus_closing = 0;
+        if (a->focus_enabled && !a->focus_recovering && a->focus_current < 0 && a->focus_pending < 0 &&
             !focus_start(a, 0)) return 0;
         status(a, "mode");
     }

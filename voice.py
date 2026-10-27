@@ -258,13 +258,14 @@ async def run():
                     schedule(value['action'])
                 elif event == 'heartbeat_timeout':
                     raise RuntimeError('The station command agent lost its heartbeat')
-                if event in ['ready', 'status', 'mode', 'focus', 'focus_error']:
+                if event in ['ready', 'status', 'mode', 'focus', 'focus_yielded', 'focus_error']:
                     status['native_agent'] = {key: value.get(key) for key in
                         ['pid', 'mode', 'recognition_starts', 'commands', 'speech_stops',
                          'recognition_active', 'native_state', 'native_speech_events',
                          'output_active', 'wake_blocks', 'queue_clear_requests',
                          'focus_enabled', 'focus_ready', 'focus_acquires',
-                         'focus_releases', 'focus_guard_pid']}
+                         'focus_releases', 'focus_guard_pid', 'focus_recovering',
+                         'focus_yields', 'focus_reacquires']}
                     if value.get('focus_ready'):
                         focus_ready.set()
                     else:

@@ -21,6 +21,7 @@ from audio_gain import SpeechGain
 from microphone_transport import MicrophoneTransport, limit_input_pipe
 from audio_focus import FOCUS_FILES, MAIND_SHA256, silent_lease
 from tts_profile import speech_profile, launcher_profile, ALSA_CONFIG
+from packet_audio import PacketEncoder, sender_socket
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / '.local/state/alice-voice-bridge'
@@ -39,6 +40,9 @@ VQE_LIBRARY_SHA256 = 'fa7ad1544fe9ddfccedcf15acc031768345b0b8c7333bc1c0b47bc476d
 AUDIO_FOCUS_MODE = os.environ.get('ALICE_AUDIO_FOCUS_MODE', 'native')
 if AUDIO_FOCUS_MODE not in ('native', 'pause'):
     raise ValueError('ALICE_AUDIO_FOCUS_MODE must be native or pause')
+PLAYBACK_TRANSPORT = os.environ.get('ALICE_PLAYBACK_TRANSPORT', 'udp')
+if PLAYBACK_TRANSPORT not in ('udp', 'ssh'):
+    raise ValueError('ALICE_PLAYBACK_TRANSPORT must be udp or ssh')
 
 
 def command(*args: str, timeout: float = 15, data: bytes | None = None) -> bytes:
@@ -113,7 +117,8 @@ def stage_station(host: str) -> None:
     for name in FOCUS_FILES:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=lease)
-    for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'native_agent.so', 'tts_gate.so']:
+    for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'packet_playback.so',
+                 'libopus.so.0', 'opus-copyright', 'native_agent.so', 'tts_gate.so']:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=(ROOT / 'build' / name).read_bytes())
     ssh(host, f'chmod 700 {REMOTE}/profile.sh')
@@ -304,6 +309,7 @@ async def run_bridge(host: str) -> None:
     modules: list[int] = []
     processes: list[asyncio.subprocess.Process] = []
     tasks: list[asyncio.Task] = []
+    udp_sender = packet_encoder = None
     state = {'pid': os.getpid(), 'host': host, 'phase': 'starting', 'modules': [],
              'microphone': MIC_SOURCE, 'speaker': SPEAKER,
              'capture_bytes': 0, 'playback_bytes': 0, 'microphone_rms': 0.0,
@@ -333,24 +339,44 @@ async def run_bridge(host: str) -> None:
                                  '--stream-name=StationMicrophone')
         state['microphone_pipe_bytes'] = limit_input_pipe(mic_player.stdin, MICROPHONE_RATE // 100 * 2)
         microphone = MicrophoneTransport(state, rms, sample_rate=MICROPHONE_RATE)
+        state['playback_transport'] = PLAYBACK_TRANSPORT
+        if PLAYBACK_TRANSPORT == 'udp':
+            speaker = await spawn(*ssh_args(host),
+                                  f'export LD_PRELOAD={REMOTE}/packet_playback.so '
+                                  f'ALICE_PACKET_PLAYBACK=1 ALICE_OPUS_LIBRARY={REMOTE}/libopus.so.0; '
+                                  f'exec aplay --version --process-id-file {REMOTE}/playback.pid')
+            ready = json.loads(await asyncio.wait_for(speaker.stdout.readline(), 10))
+            if ready.get('ready') is not True or not 0 < ready['port'] < 65536:
+                raise RuntimeError('Station packet receiver did not initialize')
+            secret = os.urandom(40)
+            packet_encoder = PacketEncoder(secret)
+            udp_sender = sender_socket((ready['ip'], ready['port']))
+            speaker.stdin.write(secret)
+            await speaker.stdin.drain()
+            state['playback_jitter_ms'] = 40
+            state['playback_codec'] = 'opus-64k-stereo'
+            state['playback_datagram_bytes'] = 0
+        else:
+            speaker = await spawn(*ssh_args(host),
+                                  f'export LD_PRELOAD={REMOTE}/playback_worker.so '
+                                  f'ALICE_PLAYBACK_WORKER=1; exec aplay --version '
+                                  f'--process-id-file {REMOTE}/playback.pid')
+            if await asyncio.wait_for(speaker.stdout.readexactly(6), 10) != b'READY\n':
+                raise RuntimeError('Station playback worker did not initialize')
+        # Start capture only after the network receiver is ready; otherwise
+        # SSH setup leaves a permanent startup backlog in the monitor pipe.
         speaker_monitor = await spawn('pacat', '--record', '--raw', '--format=s16le',
                                       '--rate=48000', '--channels=2',
                                       f'--device={SPEAKER}.monitor', '--latency-msec=20',
                                       '--process-time-msec=10',
                                       '--client-name=AliceVoiceBridge',
                                       '--stream-name=StationSpeaker')
-        speaker = await spawn(*ssh_args(host),
-                              f'export LD_PRELOAD={REMOTE}/playback_worker.so '
-                              f'ALICE_PLAYBACK_WORKER=1; exec aplay --version '
-                              f'--process-id-file {REMOTE}/playback.pid')
-        if await asyncio.wait_for(speaker.stdout.readexactly(6), 10) != b'READY\n':
-            raise RuntimeError('Station playback worker did not initialize')
         playback_queue: asyncio.Queue = asyncio.Queue(maxsize=6)
         # The window covers ALSA occupancy plus data and ACKs in transit.
         # Eight blocks give Wi-Fi jitter headroom without enlarging ALSA or
         # allowing an unbounded SSH backlog. Stale PC blocks are still dropped.
         playback_slots = asyncio.Semaphore(8)
-        state['playback_window_ms'] = 160
+        state['playback_window_ms'] = 160 if PLAYBACK_TRANSPORT == 'ssh' else 0
         pending_playback = deque()
         state['playback_dropped_bytes'] = 0
         state['playback_queue_ms'] = 0
@@ -381,6 +407,7 @@ async def run_bridge(host: str) -> None:
 
         async def read_playback() -> None:
             previous = time.monotonic()
+            sequence = 0
             while True:
                 block = await speaker_monitor.stdout.readexactly(3840)
                 now = time.monotonic()
@@ -389,23 +416,37 @@ async def run_bridge(host: str) -> None:
                 if playback_queue.full():
                     playback_queue.get_nowait()
                     state['playback_dropped_bytes'] += 3840
-                playback_queue.put_nowait((time.monotonic(), block))
+                playback_queue.put_nowait((time.monotonic(), block, sequence))
+                sequence += 1
                 state['playback_queue_ms'] = playback_queue.qsize() * 20
 
         async def write_playback() -> None:
             while True:
                 before = time.monotonic()
-                await asyncio.wait_for(playback_slots.acquire(), 3)
-                timing('playback_slot_wait', time.monotonic() - before)
-                queued_at, block = await playback_queue.get()
-                if time.monotonic() - queued_at > 0.18:
+                if PLAYBACK_TRANSPORT == 'ssh':
+                    await asyncio.wait_for(playback_slots.acquire(), 3)
+                    timing('playback_slot_wait', time.monotonic() - before)
+                queued_at, block, sequence = await playback_queue.get()
+                stale_after = .06 if PLAYBACK_TRANSPORT == 'udp' else .18
+                if time.monotonic() - queued_at > stale_after:
                     state['playback_dropped_bytes'] += len(block)
-                    playback_slots.release()
+                    if PLAYBACK_TRANSPORT == 'ssh':
+                        playback_slots.release()
                     continue
                 block = speech_gain.process(block)
                 state['playback_gain_db'] = speech_gain.gain_db
                 state['playback_limited_blocks'] = speech_gain.limited_blocks
                 state['playback_gain_silence_resets'] = speech_gain.silence_resets
+                if PLAYBACK_TRANSPORT == 'udp':
+                    packet = packet_encoder.packet(block, sequence)
+                    try:
+                        # A full socket drops this frame instead of queuing old speech.
+                        udp_sender.send(packet)
+                        state['playback_datagram_bytes'] += len(packet)
+                    except BlockingIOError:
+                        state['playback_dropped_bytes'] += len(block)
+                    state['playback_queue_ms'] = playback_queue.qsize() * 20
+                    continue
                 pending_playback.append(time.monotonic())
                 speaker.stdin.write(block)
                 before = time.monotonic()
@@ -428,6 +469,22 @@ async def run_bridge(host: str) -> None:
                 state['playback_bytes'] += 3840
                 state['playback_queue_ms'] = playback_queue.qsize() * 20
                 playback_slots.release()
+
+        async def packet_status() -> None:
+            while True:
+                line = await asyncio.wait_for(speaker.stdout.readline(), 10)
+                if not line:
+                    raise RuntimeError('Station packet receiver exited')
+                report = json.loads(line)
+                for name, value in report.items():
+                    if name not in ('received', 'played', 'redundant', 'concealed', 'late',
+                                    'duplicate', 'invalid', 'underruns', 'resync'):
+                        raise RuntimeError('Invalid station packet status')
+                    if not isinstance(value, int) or value < 0:
+                        raise RuntimeError('Invalid station packet counter')
+                    state['playback_udp_' + name] = value
+                state['playback_underruns'] = report['underruns']
+                state['playback_bytes'] = report['played'] * 3840
 
         async def errors(proc, name: str) -> None:
             while line := await proc.stderr.readline():
@@ -456,13 +513,14 @@ async def run_bridge(host: str) -> None:
                    asyncio.create_task(microphone.write(mic_player.stdin)),
                    asyncio.create_task(read_playback()),
                    asyncio.create_task(write_playback()),
-                   asyncio.create_task(acknowledge_playback()),
+                   asyncio.create_task(packet_status() if PLAYBACK_TRANSPORT == 'udp'
+                                       else acknowledge_playback()),
                    asyncio.create_task(event_loop_timing()),
                    asyncio.create_task(native_voice_mode())]
         stop_task = asyncio.create_task(stop.wait())
         tasks = streams + [asyncio.create_task(status()), stop_task]
-        for proc, name in zip(processes, ['station capture', 'virtual microphone',
-                                          'speaker monitor', 'station playback']):
+        for proc, name in [(capture, 'station capture'), (mic_player, 'virtual microphone'),
+                           (speaker_monitor, 'speaker monitor'), (speaker, 'station playback')]:
             tasks.append(asyncio.create_task(errors(proc, name)))
         state['phase'] = 'running'
         save_state(state)
@@ -512,6 +570,10 @@ async def run_bridge(host: str) -> None:
                 proc.kill()
                 await proc.wait()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if udp_sender is not None:
+            udp_sender.close()
+        if packet_encoder is not None:
+            packet_encoder.close()
         unload_modules(modules)
         print('Restoring the stock station runtime profile...', flush=True)
         try:

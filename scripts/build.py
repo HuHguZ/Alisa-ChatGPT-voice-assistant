@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from fetch_opus import fetch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,7 @@ def main():
         compiler = os.environ.get('HOST_CC', 'clang') if target == 'host' else 'clang'
         if not shutil.which(compiler):
             raise SystemExit(f'Missing compiler: {compiler}')
-        for name in ['capture_tap', 'vqe_tap', 'playback_worker', 'native_agent', 'tts_gate']:
+        for name in ['capture_tap', 'vqe_tap', 'playback_worker', 'packet_playback', 'native_agent', 'tts_gate']:
             destination = output / f'{name}{".host" if target == "host" else ""}.so'
             flags = ['-O2', '-fPIC', '-shared']
             if target == 'arm':
@@ -34,6 +35,9 @@ def main():
                 command += ['-ldl']
             subprocess.run(command, check=True)
             print(destination.relative_to(ROOT))
+        if target == 'arm':
+            fetch(output)
+            print('build/libopus.so.0 (pinned Debian ARMhf package)')
 
 
 if __name__ == '__main__':

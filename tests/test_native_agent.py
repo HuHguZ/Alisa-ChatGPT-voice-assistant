@@ -40,6 +40,7 @@ class NativeAgent(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env={**os.environ, 'LD_PRELOAD': str(ROOT / 'build/native_agent.host.so'),
                  'ALICE_NATIVE_AGENT': '1', 'ALICE_NATIVE_PORT': str(self.server.getsockname()[1]),
+                 'ALICE_TTS_GATE_FILE': str(Path(self.temp.name) / 'tts.lease'),
                  'ALICE_NATIVE_LOCK': str(Path(self.temp.name) / 'agent.lock')})
         self.addCleanup(self.cleanup)
         self.peer, _ = self.server.accept()
@@ -146,6 +147,17 @@ class NativeAgent(unittest.TestCase):
         self.peer.sendall(state_frame(1))
         with self.assertRaises(TimeoutError):
             self.peer.recv(1)
+
+    def test_speech_lease_is_renewed_in_chat_and_removed_on_exit(self):
+        lease = Path(self.temp.name)/'tts.lease'
+        self.assertFalse(lease.exists())
+        self.control('CHAT')
+        first = lease.read_text()
+        time.sleep(.02)
+        self.control('PING')
+        self.assertNotEqual(first, lease.read_text())
+        self.assertEqual(self.control('IDLE')['tts_gate_enabled'], 1)
+        self.assertFalse(lease.exists())
 
     def test_chat_preserves_wake_recognition_until_final_close(self):
         self.start_native_session()

@@ -52,6 +52,7 @@ struct agent {
     unsigned int focus_yields, focus_reacquires;
     unsigned int native_inputs, focus_input_at_start;
     double focus_idle_since, focus_retry_after;
+    const char *tts_gate_file;
 };
 
 /* A single looped native session retains its activity across replay. A
@@ -73,6 +74,8 @@ static double seconds(void) {
     if (clock_gettime(1, &t) < 0) return 0;
     return (double)t.sec + (double)t.nsec / 1000000000.0;
 }
+
+#include "tts_lease.h"
 
 static int number(const unsigned char *data, size_t length, size_t *offset, u64 *out) {
     *out = 0;
@@ -234,12 +237,12 @@ static void status(struct agent *a, const char *event) {
         "\"queue_clear_requests\":%u,\"focus_enabled\":%d,\"focus_ready\":%d,"
         "\"focus_acquires\":%u,\"focus_releases\":%u,"
         "\"focus_guard_pid\":%d,\"focus_recovering\":%d,"
-        "\"focus_yields\":%u,\"focus_reacquires\":%u}\n", event, getpid(),
+        "\"focus_yields\":%u,\"focus_reacquires\":%u,\"tts_gate_enabled\":%d}\n", event, getpid(),
         a->chat ? "chat" : "idle", a->recognition_starts, a->commands, a->speech_stops,
         a->recognizing, a->native_state, a->native_speech_events, a->output_active, a->wake_blocks,
         a->queue_clear_requests, a->focus_enabled, a->focus_ready,
         a->focus_acquires, a->focus_releases, a->focus_guard_pid,
-        a->focus_recovering, a->focus_yields, a->focus_reacquires);
+        a->focus_recovering, a->focus_yields, a->focus_reacquires, !!a->tts_gate_file);
     if (n > 0 && (size_t)n < sizeof(text) && !output(1, text, (size_t)n)) stopping = 1;
 }
 
@@ -282,6 +285,7 @@ static int focus_start(struct agent *a, int slot) {
 
 static void focus_fail(struct agent *a) {
     focus_release(a);
+    if (a->tts_gate_file) unlink(a->tts_gate_file);
     a->chat = a->pause_pending = a->focus_session_ready = a->focus_recovering = 0;
     status(a, "focus_error");
 }
@@ -417,6 +421,7 @@ static int start_focus_guard(struct agent *a, int lock, const struct local_addre
         }
     }
     unlink(a->focus_path);
+    if (a->tts_gate_file) unlink(a->tts_gate_file);
     close(pipe[0]); close(lock); _exit(0);
 }
 
@@ -515,6 +520,7 @@ static int handle_frame(struct agent *a, const unsigned char *data, size_t size)
 }
 
 static void restore(struct agent *a) {
+    if (a->tts_gate_file) unlink(a->tts_gate_file);
     if (a->focus_enabled) focus_release(a);
     if (a->recognizing) alice_method(a, STOP_CONVERSATION);
     a->chat = a->recognizing = 0;
@@ -527,11 +533,13 @@ static void restore(struct agent *a) {
 
 static int control(struct agent *a, const char *line) {
     a->heartbeat = seconds();
+    if (a->chat && !tts_lease_refresh(a->tts_gate_file)) return 0;
     if (a->focus_enabled && write(a->focus_guard_fd, "P", 1) != 1) return 0;
     if (!strcmp(line, "PING")) status(a, "status");
     else if (!strcmp(line, "CHAT")) {
         if (!a->chat) a->focus_session_ready = 0;
         a->chat = 1;
+        if (!tts_lease_refresh(a->tts_gate_file)) return 0;
         a->focus_closing = 0;
         if (a->focus_enabled && !a->focus_recovering && a->focus_current < 0 && a->focus_pending < 0 &&
             !focus_start(a, 0)) return 0;
@@ -578,6 +586,7 @@ __attribute__((constructor)) static void run_agent(void) {
     struct local_address address =
         {2, (unsigned short)((port >> 8) | (port << 8)), {127,0,0,1}, {0}};
     struct agent a = {0}; a.fd = -1; a.native_state = -1;
+    a.tts_gate_file = getenv("ALICE_TTS_GATE_FILE");
     a.focus_current = a.focus_pending = -1;
     a.focus_guard_fd = -1;
     const char *native_focus = getenv("ALICE_NATIVE_FOCUS");

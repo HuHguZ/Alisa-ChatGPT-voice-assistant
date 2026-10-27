@@ -15,7 +15,7 @@ cleanup_receivers() {
                 ;;
         esac
     done
-    rm -f "$BASE/microphone.sock" "$BASE/native-muted"
+    rm -f "$BASE/microphone.sock" "$BASE/native-muted" "$BASE/tts.lease" "$BASE/tts.lease.new" "$BASE/tts-gate.status"
 }
 
 cancel_guard() {

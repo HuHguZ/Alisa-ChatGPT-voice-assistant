@@ -20,6 +20,7 @@ import time
 from audio_gain import SpeechGain
 from microphone_transport import MicrophoneTransport, limit_input_pipe
 from audio_focus import FOCUS_FILES, MAIND_SHA256, silent_lease
+from tts_profile import speech_profile, launcher_profile, ALSA_CONFIG
 
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / '.local/state/alice-voice-bridge'
@@ -85,36 +86,25 @@ def save_state(state: dict) -> None:
 
 def stage_station(host: str) -> None:
     """Add a nonblocking capture tap to a separate, temporary launcher profile."""
-    if AUDIO_FOCUS_MODE == 'native':
-        digest = ssh(host, 'sha256sum /system/vendor/quasar/maind').decode().split()[0]
-        if digest != MAIND_SHA256:
-            raise RuntimeError('Unverified native audio-focus protocol for this maind build')
+    # Native focus and the isolated speech route both pin this firmware build.
+    digest = ssh(host, 'sha256sum /system/vendor/quasar/maind').decode().split()[0]
+    if digest != MAIND_SHA256:
+        raise RuntimeError('Unverified native speech/focus protocol for this maind build')
     if MICROPHONE_MODE == 'vqe':
         digest = ssh(host, 'sha256sum /system/vendor/quasar/libs/libyandex_evil.so').decode().split()[0]
         if digest != VQE_LIBRARY_SHA256:
             raise RuntimeError('Unverified VQE library ABI; select ALICE_MICROPHONE_SOURCE=raw')
     stock = ssh(host, 'cat /etc/asound.conf').decode()
     launch = json.loads(ssh(host, 'cat /system/vendor/quasar/launch.json'))
+    quasar = speech_profile(json.loads(ssh(host, 'cat /system/vendor/quasar/quasar.cfg')))
     if stock.count('pcm "hw:0,1"') != 1:
         raise RuntimeError('Unexpected ALSA configuration; refusing to change the runtime profile')
-    patched = 0
-    for node in launch['nodes']:
-        for task in node['tasks']:
-            if '--platformd' not in task.get('arg', []):
-                continue
-            env = task.get('envs', [])
-            if any(s.startswith('LD_PRELOAD=') for s in env):
-                raise RuntimeError('A custom LD_PRELOAD is already configured')
-            helper = 'vqe_tap' if MICROPHONE_MODE == 'vqe' else 'capture_tap'
-            task['envs'] = env + [f'LD_PRELOAD={REMOTE}/{helper}.so',
-                                  f'ALICE_CAPTURE_SOCKET={REMOTE}/microphone.sock',
-                                  f'ALICE_NATIVE_MUTE_FILE={REMOTE}/native-muted']
-            patched += 1
-    if patched != 1:
-        raise RuntimeError('Expected exactly one stock platformd task')
+    launch = launcher_profile(launch, REMOTE, MICROPHONE_MODE)
     files = {
         'launch.bridge.json': json.dumps(launch, indent=2) + '\n',
         'profile.sh': (ROOT / 'station/profile.sh').read_text(),
+        'quasar.speech.json': json.dumps(quasar, indent=2) + '\n',
+        'tts-asound.conf': ALSA_CONFIG,
     }
     ssh(host, f'umask 077; mkdir -p {REMOTE}')
     for name, text in files.items():
@@ -123,7 +113,7 @@ def stage_station(host: str) -> None:
     for name in FOCUS_FILES:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=lease)
-    for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'native_agent.so']:
+    for name in ['capture_tap.so', 'vqe_tap.so', 'playback_worker.so', 'native_agent.so', 'tts_gate.so']:
         ssh(host, f'umask 077; cat > {REMOTE}/{name}.new && mv {REMOTE}/{name}.new {REMOTE}/{name}',
             data=(ROOT / 'build' / name).read_bytes())
     ssh(host, f'chmod 700 {REMOTE}/profile.sh')
@@ -143,9 +133,14 @@ def has_shared_profile(host: str) -> bool:
     # A running raw tap and a new VQE tap have different sample rates. Do not
     # reuse the launcher just because its configuration pathname is the same.
     mapped = ssh(host, 'for p in $(pidof maind); do '
-                 'sed -n "/alice-voice.*tap\\.so/p" /proc/$p/maps; done')
+                 'case "$(tr "\\000" " " </proc/$p/cmdline)" in *--platformd*) '
+                 'sed -n "/alice-voice.*tap\\.so/p" /proc/$p/maps;; esac; done')
+    speech_mapped = ssh(host, 'for p in $(pidof maind); do '
+                        'case "$(tr "\\000" " " </proc/$p/cmdline)" in *--mediad*) '
+                        'sed -n "/alice-voice.*tts_gate\\.so/p" /proc/$p/maps;; esac; done')
     helper = 'vqe_tap' if MICROPHONE_MODE == 'vqe' else 'capture_tap'
-    return f'{REMOTE}/{helper}.so'.encode() in mapped
+    return (f'{REMOTE}/{helper}.so'.encode() in mapped and
+            f'{REMOTE}/tts_gate.so'.encode() in speech_mapped)
 
 
 def rms(data: bytes) -> float:

@@ -214,6 +214,7 @@ async def run():
         proc = await asyncio.create_subprocess_exec(
             *ssh_args(read_state()['host']),
             f'export LD_PRELOAD={REMOTE}/native_agent.so ALICE_NATIVE_AGENT=1 '
+            f'ALICE_TTS_GATE_FILE={REMOTE}/tts.lease '
             f'ALICE_NATIVE_FOCUS={int(AUDIO_FOCUS_MODE == "native")}; '
             f'exec aplay --version --alice-native-agent {REMOTE}/native_agent.so',
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -265,7 +266,7 @@ async def run():
                          'output_active', 'wake_blocks', 'queue_clear_requests',
                          'focus_enabled', 'focus_ready', 'focus_acquires',
                          'focus_releases', 'focus_guard_pid', 'focus_recovering',
-                         'focus_yields', 'focus_reacquires']}
+                         'focus_yields', 'focus_reacquires', 'tts_gate_enabled']}
                     if value.get('focus_ready'):
                         focus_ready.set()
                     else:

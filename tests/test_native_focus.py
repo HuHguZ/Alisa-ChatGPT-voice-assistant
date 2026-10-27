@@ -53,6 +53,7 @@ class NativeFocus(unittest.TestCase):
                  'ALICE_NATIVE_AGENT': '1', 'ALICE_NATIVE_FOCUS': '1',
                  'ALICE_FOCUS_TEMPLATE': str(template), 'ALICE_FOCUS_DIRECTORY': temp.name,
                  'ALICE_NATIVE_PORT': str(self.server.getsockname()[1]),
+                 'ALICE_TTS_GATE_FILE': str(Path(temp.name)/'tts.lease'),
                  'ALICE_NATIVE_LOCK': str(Path(temp.name)/'agent.lock')})
         self.addCleanup(self.cleanup)
         self.peer, _ = self.server.accept()
@@ -166,6 +167,7 @@ class NativeFocus(unittest.TestCase):
         self.proc.wait(timeout=2)
         self.guardian_stop(path)
         self.assertFalse(Path(path.decode()).exists())
+        self.assertFalse((Path(path.decode()).parent/'tts.lease').exists())
 
     def test_independent_guard_releases_when_agent_is_frozen(self):
         path, request = self.begin()

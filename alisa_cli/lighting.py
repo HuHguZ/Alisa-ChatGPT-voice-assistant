@@ -41,6 +41,8 @@ class Preview:
                         # The demo restores the actual pre-demo frame, while the
                         # runtime normally restores idle darkness after a call.
                         script=script.replace("saved=' 0 0 0 0 0 0 0 0 0'",'saved="$task_led_current"')
+                        # The demo shows the chosen GPT style, not the listening wave.
+                        script=script.replace('listen=${ALISA_LISTEN_LED:-1}','listen=0')
                         self.process=subprocess.Popen(station.args()+['sh -c '+shlex.quote(script)],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                         self.thread=threading.Thread(target=self.animate,daemon=True);self.thread.start()
                 except (RuntimeError,OSError,subprocess.SubprocessError):self.error='Демо недоступно: проверьте SSH. Выбор цвета доступен.'

@@ -15,6 +15,22 @@ saved=''
 saved_triggers=''
 painted=''
 blue=' 0 0 160 0 0 160 0 0 160'
+# The client sends dark frames whenever GPT is silent, i.e. while the owner
+# speaks and while GPT thinks. Show a soft cyan wave then, so an open chat is
+# visibly listening. Style "off" keeps the ring dark.
+listen=${ALISA_LISTEN_LED:-1}
+[ "${ALISA_LED_STYLE:-}" != off ] || listen=0
+tick=0
+listening_frame() {
+    tick=$(( (tick + 1) % 16 ))
+    task_led_decoded=''
+    for task_led_zone in 0 5 10; do
+        task_led_step=$(( (tick + task_led_zone) % 16 ))
+        [ "$task_led_step" -le 8 ] || task_led_step=$(( 16 - task_led_step ))
+        task_led_level=$(( 20 + task_led_step * 13 ))
+        task_led_decoded="$task_led_decoded 0 $(( task_led_level / 2 )) $task_led_level"
+    done
+}
 decode_frame() {
     set -- $1
     [ "$#" = 9 ] || return 1
@@ -134,6 +150,9 @@ while IFS= read -r -t 2 task_led_command; do
     case "$task_led_command" in
         B) task_led_requested=$blue ;;
         F\ *) decode_frame "${task_led_command#F }" || continue
+              if [ "$listen" = 1 ] && [ "$task_led_decoded" = ' 0 0 0 0 0 0 0 0 0' ]; then
+                  listening_frame
+              fi
               task_led_requested=$task_led_decoded ;;
         0) release; continue ;;
         *) continue ;;

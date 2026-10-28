@@ -1,8 +1,0 @@
-# Add to ~/.ssh/config; replace the address and the key path with your own.
-Host alice
-    HostName STATION_IP
-    User root
-    Port 2222
-    IdentityFile ~/.ssh/id_ed25519_alice
-    IdentitiesOnly yes
-    StrictHostKeyChecking yes

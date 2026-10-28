@@ -1,35 +1,18 @@
-# Dependencies, compiled helpers and downloaded models
-.venv/
 __pycache__/
 *.py[cod]
 /build/
-/models/
-/display-tools/
-
-# Device backups, local measurements, authentication and recordings
-/backups/
-/*-test*.json
-/verified-configuration.json
-/autostart-verification.json
-/browser-profile/
-/state/
+/dist/
+/third_party/
+/alisa-voice-sources.tar.gz*
+/zig.tar.xz
+/engines/native/build/
+/engines/native/research/
+/engines/native/toolchains/
+**/browser-profile/
+**/state/
+**/backups/
 .env
 .env.*
 *.pem
 *.key
-id_ed25519*
-*.wav
-*.raw
-*.pcm
-*.log
-*.zip
-*.tar.*
-
-# Keep only the source of optional smoke tests
-/test-tools/*
-!/test-tools/requirements.txt
-!/test-tools/verify_marker_resume.py
-!/test-tools/verify_web_close.py
-!/test-tools/verify_mode_cue.py
-!/test-tools/measure_latency.py
-!/test-tools/native_input.c
+/engines/bridge/build/*.host.so

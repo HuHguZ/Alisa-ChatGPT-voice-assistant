@@ -1,2 +1,0 @@
-# Runtime uses only the Python standard library.
-# Optional diagnostic dependencies: test-tools/requirements.txt

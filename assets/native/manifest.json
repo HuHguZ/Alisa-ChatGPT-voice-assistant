@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "model": "plum",
+  "architecture": "armhf",
+  "audio_engine": "WebRTC NetEq",
+  "revision": 5,
+  "files": {
+    "native_agent.so": "428e27699a62b0d17a687892612f971ccb0275ba0de3f0d12b5b80c7bc9b4860",
+    "vqe_tap.so": "7fff71a18f78aedb35085d0a38cf6ee84bf75538b8f0832337dacbe74048e73f",
+    "tts_gate.so": "3cf0263a73e934704e0ecc4c7a5a633610b284dbccffdd6db8cc14e5e9384d32",
+    "run.sh": "0efd47548e36b244be33f42481bcde4c67751cc4b43dd7243ebae18af9671a9d",
+    "profile.sh": "796895d54657a9b60d82e547bebab5d8d5185aa5dea193fe9ff320035d86f77b",
+    "indicator.sh": "520b7b964c0ee0fcb0f90d2e8b4a6a1478075faced96df15a6897ad6e5bf3db2",
+    "mark.so": "86388c995080d76b95965d6e926304be19025b1e7f253c7ecf4c1f2919497845",
+    "focus-0.wav": "6e49db6ecc812f32cb043fb3c02e4aea55329fa8df27724c5b4e2a76ed57c360",
+    "bin/alisa-standalone": "ad7a3e1a9fb5c004c89b4508b7f0c41cb126a232641ca0f2e939f28a4a266c57",
+    "licenses/webrtc-LICENSE": "ab00a482b6a3902e40211b43c5d0441962ea99b6cc7c25c0f243fa270b78d482",
+    "licenses/webrtc-PATENTS": "01462e2068d1a04c2274f3389773014c14ed9bc3446b28303543bd3e3c064145",
+    "licenses/webrtc-AUTHORS": "6ee00fd8589352cfb7632d88ff22a60534f39a4690d40d1ae461ca4752a03a92",
+    "licenses/webrtc-ooura-LICENSE": "25b7731b70c77ecd5f3bb19303fbaa99be18860f81d44f71da670fdcd04829db",
+    "licenses/webrtc-spl-sqrt-LICENSE": "41d791701e3e1c1073470403de7e342442d1e6a2af72681023b13a2f45f2125c",
+    "licenses/abseil-LICENSE": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747",
+    "licenses/libdatachannel-LICENSE": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+    "licenses/libjuice-LICENSE": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+    "licenses/usrsctp-LICENSE": "fa53711b25af4b9a9b8dadfea3cb38166ec4b96760c8d62b284055554537d9ef",
+    "licenses/libsrtp-LICENSE": "8e19d42a1eec9561f3f347253ddf2e385c55f392f025bb0fd41b88dbf38db5ae",
+    "licenses/json-LICENSE": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603",
+    "licenses/curl-COPYING": "82f2f4427d6545ee5aaac4f0b80428da6cc8ba41c2cf5da3a03680ec327b9681",
+    "licenses/openssl-LICENSE": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+    "licenses/opus-COPYING": "01e1167d54a096d123cf6dfbbeb19587278845c6481d2d66d545669846079551",
+    "licenses/plog-LICENSE": "e4d01796524cbc13b1571a1f0914823c6a23b316ba039e7014f47a4eef7fd4c3"
+  }
+}

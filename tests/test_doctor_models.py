@@ -34,4 +34,13 @@ class Models(unittest.TestCase):
   r=self.check('bridge',output('yandex,station-micro',*LITE1))
   self.assertEqual(r['station_missing'],['socat'])
 
+ def test_windows_chromium_outside_path_counts_as_installed(self):
+  import os,tempfile
+  from pathlib import Path
+  with tempfile.TemporaryDirectory() as folder:
+   exe=Path(folder)/'Chromium/Application/chrome.exe';exe.parent.mkdir(parents=True);exe.write_bytes(b'')
+   with patch.object(doctor.sys,'platform','win32'),patch.dict(os.environ,{'LOCALAPPDATA':folder}):
+    self.assertEqual(doctor.windows_chromium(),exe)
+   with patch.object(doctor.sys,'platform','linux'):self.assertIsNone(doctor.windows_chromium())
+
 if __name__=='__main__':unittest.main()

@@ -11,6 +11,13 @@ BUILDS={
                                        'df67c7ad9fb9f2f9c473ba2aaed7663a0e898a2c6622993e65d3b8834a0b3646')]),
 }
 
+def windows_chromium():
+    # Windows Chromium installs chrome.exe outside PATH; windows_login.py uses it.
+    if sys.platform!='win32':return None
+    import os,pathlib
+    return next((p for p in (pathlib.Path(os.environ.get(v,''))/'Chromium/Application/chrome.exe'
+                             for v in ('LOCALAPPDATA','PROGRAMFILES')) if p.is_file()),None)
+
 def inspect(config):
     s=Station(config)
     script='id -u; uname -m; cat /proc/device-tree/compatible; printf "\\n"; sha256sum /system/vendor/quasar/maind /system/vendor/quasar/libs/libyandex_evil.so; df -Pk /data; for x in aplay socat base64 sha256sum ip; do command -v "$x" || true; done'
@@ -20,7 +27,7 @@ def inspect(config):
     model=next((name for name,(markers,_) in BUILDS.items() if any(m in line for m in markers for line in lines)),None)
     compatible=model is not None
     abi=compatible and any(any(maind in line for line in lines) and any(vqe in line for line in lines) for maind,vqe in BUILDS[model][1])
-    missing=[tool for tool in ['ssh','chromium'] if not shutil.which(tool)]
+    missing=[tool for tool in ['ssh','chromium'] if not shutil.which(tool) and not (tool=='chromium' and windows_chromium())]
     if config['mode']=='bridge':
         for tool in ['pactl','pacat','paplay','Xvfb','xauth']:
             if not shutil.which(tool) and not (tool=='Xvfb' and (__import__('pathlib').Path(__file__).resolve().parents[1]/'engines/bridge/display-tools/usr/bin/Xvfb').exists()):missing.append(tool)

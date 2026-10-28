@@ -40,7 +40,11 @@ cat > {temporary}
 [ "$(wc -c < {temporary})" -eq {len(data)} ]
 [ "$(sha256sum {temporary} | cut -d ' ' -f 1)" = {expected} ]
 chmod {mode:o} {temporary}
+# UBIFS keeps written data in RAM for up to ~30 s. Unplugging the Station
+# then leaves an empty file, so flush the data and then the rename.
+sync
 mv {temporary} {q}
+sync
 trap - EXIT
 '''
         self.run(command,data=data,timeout=max(60,60+len(data)//(128*1024)))

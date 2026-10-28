@@ -37,7 +37,7 @@ class Preview:
                     if not self.error:
                         station=Station(self.config)
                         station.run('test -d /sys/class/leds/plum:red:ring1 || test -d /sys/class/leds/micro:red:ring1',timeout=12)
-                        script=(ROOT/'assets/native/indicator.sh').read_text()
+                        script=(ROOT/'assets/native/indicator.sh').read_text(encoding='utf-8')
                         # The demo restores the actual pre-demo frame, while the
                         # runtime normally restores idle darkness after a call.
                         script=script.replace("saved=' 0 0 0 0 0 0 0 0 0'",'saved="$task_led_current"')

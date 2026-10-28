@@ -15,7 +15,7 @@ def archive_settings(station):
     station.put(NATIVE+'/state/settings.json',json.dumps(fresh).encode())
 
 def install_session(config,candidate,destination):
-    station=Station(config);new=json.loads(candidate.read_text())
+    station=Station(config);new=json.loads(candidate.read_text(encoding='utf-8'))
     remote=TOOLS+'/auth-check'
     station.put(remote+'/web-session.json',candidate.read_bytes())
     try:

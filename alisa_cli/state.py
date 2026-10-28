@@ -29,7 +29,7 @@ def defaults(mode):
 def load(mode):
     p=HOME/mode/'config.json'
     if not p.exists():return defaults(mode)
-    value=json.loads(p.read_text());validate(value);return value
+    value=json.loads(p.read_text(encoding='utf-8'));validate(value);return value
 
 def save(value):
     validate(value);write_private(HOME/value['mode']/'config.json',value)

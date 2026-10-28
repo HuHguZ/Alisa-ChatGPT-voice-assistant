@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """One-time ChatGPT sign-in for native mode from a Windows desktop.
 
-Windows counterpart of import_web_session.py --interactive: a visible Chromium
-window with its own profile, DevTools on an ephemeral loopback port (Windows
-has no inherited --remote-debugging-pipe descriptors), and the same session
-fields. The result goes through accounts.install_session, which verifies the
+Windows counterpart of the Linux login: the owner signs in in a plain
+Chromium window with its own profile (no DevTools attached, so site checks see
+an ordinary browser). Then a short off-screen pass on that profile reads the
+same session fields as import_web_session.py through DevTools on an ephemeral
+loopback port (Windows has no inherited --remote-debugging-pipe descriptors). The result goes through accounts.install_session, which verifies the
 login on the Station before replacing the saved one. Tokens are never printed.
 """
-import argparse,base64,json,os,secrets,socket,struct,subprocess,sys,time
+import argparse,base64,contextlib,json,os,secrets,socket,sqlite3,struct,subprocess,sys,time
 from pathlib import Path
 
 ROOT=Path(__file__).resolve().parents[3]
@@ -67,12 +68,58 @@ class DevTools:
                 return msg.get('result',{})
 
 
-def capture(chromium,profile,minutes):
+def session_cookie_saved(profile):
+    """Only cookie names are read; values stay encrypted in the profile."""
+    for path in (profile/'Default/Network/Cookies',profile/'Default/Cookies'):
+        if not path.exists():continue
+        try:
+            uri=path.resolve().as_uri()+'?mode=ro&immutable=1'
+            with contextlib.closing(sqlite3.connect(uri,uri=True,timeout=1)) as db:
+                if db.execute("select 1 from cookies where host_key like '%chatgpt.com' and "
+                              "name like '%session-token%' limit 1").fetchone():return True
+        except sqlite3.Error:pass
+    return False
+
+
+def sign_in(chromium,profile,minutes):
+    """A plain window: no DevTools, no automation flags while the owner signs in
+    and passes any Cloudflare check. It ends when the session cookie is on disk
+    or the owner closes the window."""
+    proc=subprocess.Popen([str(chromium),f'--user-data-dir={profile}','--no-first-run','--no-default-browser-check',
+        '--new-window','https://chatgpt.com/'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    # An existing session would be detected at once, before Cloudflare has
+    # cleared this visit; then the owner closes the window when the chat shows.
+    already=session_cookie_saved(profile)
+    print('Waiting for sign-in in a plain Chromium window'+(' (already signed in: close it when the chat opens)' if already else '')+'...',flush=True)
+    deadline=time.time()+minutes*60
+    while time.time()<deadline and proc.poll() is None:
+        if not already and session_cookie_saved(profile):
+            print('Session cookie saved; closing the sign-in window.',flush=True)
+            time.sleep(5)
+            # Without /F taskkill asks Chromium to close, so it flushes cookies.
+            subprocess.run(['taskkill','/PID',str(proc.pid)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            break
+        time.sleep(3)
+    try:proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        subprocess.run(['taskkill','/T','/F','/PID',str(proc.pid)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        proc.wait()
+    # The browser process tree may linger briefly and keep the profile locked.
+    time.sleep(3)
+
+
+def capture(chromium,profile,minutes,skip_sign_in=False):
     profile.mkdir(parents=True,exist_ok=True)
+    if not skip_sign_in:sign_in(chromium,profile,minutes)
     port_file=profile/'DevToolsActivePort';port_file.unlink(missing_ok=True)
+    # Second, short pass on the same profile, only to read its cookies. It opens
+    # about:blank and uses browser-level DevTools, so no chatgpt.com page (and no
+    # Cloudflare check) is loaded with a debugger attached. The Station then
+    # obtains the access token itself through install_session's refresh.
     proc=subprocess.Popen([str(chromium),f'--user-data-dir={profile}','--remote-debugging-port=0',
         '--remote-debugging-address=127.0.0.1','--no-first-run','--no-default-browser-check','--new-window',
-        'https://chatgpt.com/'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        '--window-position=-32000,-32000','--window-size=400,300','about:blank'],
+        stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     try:
         for _ in range(100):
             if port_file.exists() and len(port_file.read_text().split())>=2:break
@@ -80,36 +127,18 @@ def capture(chromium,profile,minutes):
         else:raise RuntimeError('Chromium did not open DevTools')
         port,path=port_file.read_text().split()[:2]
         tools=DevTools(int(port),path)
-        expression=("location.origin==='https://chatgpt.com'?fetch('/api/auth/session',{credentials:'include'})"
-                    ".then(r=>r.json()).catch(()=>null):null")
-        deadline=time.time()+minutes*60;data=None;session=None
-        print('Waiting for sign-in in the Chromium window...',flush=True)
-        while time.time()<deadline:
-            if proc.poll() is not None:raise RuntimeError('Login window was closed before sign-in completed')
-            try:
-                if session is None:
-                    targets=tools.command('Target.getTargets')['targetInfos']
-                    page=next((x for x in targets if x['type']=='page' and x['url'].startswith('https://chatgpt.com/')),None)
-                    if page:session=tools.command('Target.attachToTarget',{'targetId':page['targetId'],'flatten':True})['sessionId']
-                if session:
-                    data=tools.command('Runtime.evaluate',{'expression':expression,'awaitPromise':True,'returnByValue':True},session).get('result',{}).get('value')
-                    if isinstance(data,dict) and data.get('accessToken'):break
-            except RuntimeError:
-                # Sign-in navigates across origins and destroys the attached page.
-                session=None
-            time.sleep(1.5)
-        if not isinstance(data,dict) or not data.get('accessToken'):raise RuntimeError('Sign-in was not completed in time')
-        cookies=tools.command('Network.getCookies',{'urls':['https://chatgpt.com/']},session).get('cookies',[])
+        print('Reading the saved session cookies...',flush=True)
+        cookies=[c for c in tools.command('Storage.getCookies').get('cookies',[])
+                 if c.get('domain','').lstrip('.')=='chatgpt.com']
         allowed=[c for c in cookies if c['name'].startswith(('__Secure-next-auth.session-token','__Secure-authjs.session-token'))
                  or c['name'] in ('oai-did','cf_clearance')]
-        if not any('session-token' in c['name'] for c in allowed):raise RuntimeError('No renewable web-session cookie was available')
-        agent=tools.command('Runtime.evaluate',{'expression':'navigator.userAgent','returnByValue':True},session).get('result',{}).get('value')
-        payload={'access_token':data['accessToken'],'expires':data.get('expires'),'account_id':(data.get('account') or {}).get('id'),
-                 'cookies':{c['name']:c['value'] for c in allowed},'user_agent':agent}
-        plan=(data.get('account') or {}).get('planType') or (data.get('user') or {}).get('plan_type')
+        if not any('session-token' in c['name'] for c in allowed):raise RuntimeError('Not signed in yet: no session cookie in the profile')
+        agent=tools.command('Browser.getVersion').get('userAgent')
+        print('reader: cookies',sorted(c['name'] for c in allowed),flush=True)
+        payload={'cookies':{c['name']:c['value'] for c in allowed},'user_agent':agent}
         try:tools.command('Browser.close')
         except RuntimeError:pass
-        return payload,plan
+        return payload,None
     finally:
         try:proc.wait(timeout=10)
         except subprocess.TimeoutExpired:proc.terminate()
@@ -119,11 +148,12 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--minutes',type=int,default=20)
     parser.add_argument('--chromium',type=Path)
+    parser.add_argument('--skip-sign-in',action='store_true',help='Reuse the profile that is already signed in')
     args=parser.parse_args()
     chromium=args.chromium or next((p for p in CANDIDATES if p.exists()),None)
     if not chromium:raise RuntimeError('Chromium is not installed')
     config=state.load('native');folder=state.HOME/'native'
-    payload,plan=capture(chromium,folder/'browser-profile',args.minutes)
+    payload,plan=capture(chromium,folder/'browser-profile',args.minutes,args.skip_sign_in)
     candidate=folder/('.login-candidate-'+str(time.time_ns())+'.json')
     state.write_private(candidate,json.dumps(payload).encode())
     try:

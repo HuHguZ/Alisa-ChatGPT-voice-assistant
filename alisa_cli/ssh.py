@@ -15,7 +15,10 @@ class Station:
         if c.get('user'):a+=['-l',c['user']]
         return a+[c['host']]
     def run(self,command,data=None,check=True,timeout=60):
-        result=subprocess.run(self.args()+[command],input=data,capture_output=True,timeout=timeout)
+        # Windows OpenSSH waits for EOF on an inherited stdin even after the
+        # remote command exits, so never inherit it when nothing is sent.
+        stdin={'input':data} if data is not None else {'stdin':subprocess.DEVNULL}
+        result=subprocess.run(self.args()+[command],capture_output=True,timeout=timeout,**stdin)
         if check and result.returncode:
             # Never surface arbitrary remote stdout (which may contain credentials).
             error=result.stderr.decode(errors='replace')

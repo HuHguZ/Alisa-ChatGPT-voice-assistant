@@ -293,7 +293,7 @@ def wait_until(title,ready,interval=.5):
     app.run(pre_run=lambda:app.create_background_task(watch()))
 
 LABELS={'mode':'Режим','phase':'Состояние','agent_connected':'Контроллер колонки','login_saved':'Вход ChatGPT сохранён',
- 'ssh':'Подключение SSH','root':'Права root','plum':'Модель Лайт 2','firmware_abi_supported':'Совместимая прошивка',
+ 'ssh':'Подключение SSH','root':'Права root','plum':'Модель Лайт 2 / Лайт 1','firmware_abi_supported':'Совместимая прошивка',
  'architecture':'Архитектура','free_data_kib':'Свободно на колонке, КиБ','host_missing':'Отсутствуют компоненты ПК',
  'station_missing':'Отсутствуют компоненты колонки','ok':'Проверка пройдена','country':'Страна выхода','ip':'Внешний IP',
  'network_status':'Проверка IP','chatgpt_http_status':'HTTP ChatGPT','voice_verified':'Голос проверен','message':'Подробности',

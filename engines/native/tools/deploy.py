@@ -54,8 +54,11 @@ def main():
     parser.add_argument('--binary',type=Path,default=ROOT/'build/client/alisa-standalone',
                         help='Validated ARM client binary (default: build/client/alisa-standalone)')
     args=parser.parse_args()
-    for path,digest in [('/system/vendor/quasar/maind',MAIND),('/system/vendor/quasar/libs/libyandex_evil.so',VQE)]:
-        if ssh(args.host,'sha256sum '+path).decode().split()[0]!=digest:raise RuntimeError('Unverified firmware ABI')
+    import sys;sys.path.insert(0,str(ROOT.parents[1]))
+    from alisa_cli.doctor import BUILDS
+    pair=tuple(ssh(args.host,'sha256sum '+path).decode().split()[0] for path in
+               ['/system/vendor/quasar/maind','/system/vendor/quasar/libs/libyandex_evil.so'])
+    if not any(pair in pairs for _,pairs in BUILDS.values()):raise RuntimeError('Unverified firmware ABI')
     launch=json.loads(ssh(args.host,'cat /system/vendor/quasar/launch.json'))
     quasar=json.loads(ssh(args.host,'cat /system/vendor/quasar/quasar.cfg'))
     launch,quasar=profiles(launch,quasar)

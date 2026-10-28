@@ -36,7 +36,7 @@ class Preview:
                             self.error='Сейчас идёт разговор GPT: демо не меняет его индикацию. Цвет можно выбрать и сохранить.'
                     if not self.error:
                         station=Station(self.config)
-                        station.run('test -d /sys/class/leds/plum:red:ring1',timeout=12)
+                        station.run('test -d /sys/class/leds/plum:red:ring1 || test -d /sys/class/leds/micro:red:ring1',timeout=12)
                         script=(ROOT/'assets/native/indicator.sh').read_text()
                         # The demo restores the actual pre-demo frame, while the
                         # runtime normally restores idle darkness after a call.
